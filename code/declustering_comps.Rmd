@@ -1,0 +1,360 @@
+---
+title: "Horus declustering"
+output: html_notebook
+---
+
+
+
+```{r}
+library(ETAS)
+
+HORUS_Ita_Catalog <- read.delim("~/Italy_background/HORUS_Ita_Catalog.txt")
+hist(HORUS_Ita_Catalog$Mw)
+```
+
+Now we should keep all events > Mc and do the full declustering on this, but I want to try the code on a smaller dataset first.
+
+```{r}
+Hm4 <- subset(HORUS_Ita_Catalog, HORUS_Ita_Catalog$Year < 2010)
+Hm4 <- subset(Hm4, Hm4$Mw >= 4)
+nrow(Hm4)
+```
+So now we want to get this into an ETAS-package friendly format (joy!).
+Let's start by looking at the Iran example in  the code...
+
+```{r}
+
+### Need to set up an ETAS::catalog object for this
+### From the documentation:
+### 'The data is required to have at least 5 columns with names date, time, lat, long and mag containing, respectively, the date, time, latitude, longitude and magnitude of each event in the catalog.'
+### catalog(data, time.begin=NULL, study.start=NULL,
+###          study.end=NULL, study.length=NULL,
+###          lat.range=NULL, long.range=NULL,
+###       region.poly=NULL, mag.threshold=NULL,
+###          flatmap=TRUE, dist.unit = "degree", 
+###          roundoff=TRUE, tz="GMT")
+
+date <- paste0(Hm4$Year, "-", Hm4$Mo, "-", Hm4$Da)
+time <- paste0(Hm4$Ho, ":", Hm4$Mi, ":", Hm4$Se)
+Hm4.cat <- data.frame(date, time, Hm4$Lat, Hm4$Lon, Hm4$Mw, Hm4$sigMw)
+colnames(Hm4.cat) <- c("date", "time", "lat", "long", "mag", "sigMw")
+
+## This is currently 15:67 which obviously as.posixlt does not like
+Hm4.cat$time[766] <- "15:57:33"
+## Modified ETAS code to specify format ="%Y-%m-%d %H:%M:%OS" when converting to posixlt, otherwise time information is omitted and a lot of events are considered simultaneous because they happen on the same day!
+Hm4.EC <- ETAS.catalog(Hm4.cat, mag.threshold=5)
+Hm4.EC
+```
+
+```{r}
+## Initial param values from the ETAS package for their Italy catalogue, might as well start with these!
+# setting initial parameter values
+mu <- 1
+k0 <- 0.005
+c <- 0.005
+alpha <- 1.05
+p <- 1.01
+D <- 1.1
+q <- 1.52
+gamma <- 0.6
+
+  # reparametrization: transform k0 to A
+A <- pi * k0 / ((p - 1) * c^(p - 1) * (q - 1) * D^(q - 1))
+param0 <- c(mu, A, c, alpha, p, D, q, gamma)
+
+
+## Does not converge with these params...
+## Not surpising really, these seem terrible...
+# fitting the model
+## Not run: 
+nthreads <- parallel::detectCores()
+
+#param0 <- c(0.5, 0.3, c, 1.5, p, 1, 1, 1)
+
+start_time <- Sys.time()
+italy.fit <- etas(Hm4.EC, param0, nthreads=nthreads)
+end_time <- Sys.time()
+end_time- start_time
+
+## End(Not run)
+## at Mc = 5
+## 1.084968392 0.122181898 0.040658451 1.995753865 1.178329789 0.000896762 1.954253344 1.492460413 
+
+param0 = c(1.084968392, 0.122181898, 0.040658451, 1.995753865, 1.178329789, 0.000896762, 1.954253344, 1.492460413) 
+Hm4.EC <- ETAS.catalog(Hm4.cat, mag.threshold=4)
+start_time <- Sys.time()
+italy.fit <- etas(Hm4.EC, param0, nthreads=nthreads)
+end_time <- Sys.time()
+end_time- start_time
+```
+
+
+```{r}
+
+Hm4.cat$pb <- italy.fit$pb
+
+#### ETAS declustered Hm4
+Hm4_etasdec <- subset(Hm4.cat, Hm4.cat$pb > runif(length(Hm4.cat$pb)))
+
+```
+
+#### Now let's do some inlabru stuff...
+
+
+```{r}
+library(sp)
+library(sf)
+library(inlabru)
+library(INLA)
+library(future.apply)
+library(ggplot2)
+library(rgeos)
+library(rgdal)
+library(raster)
+library(terra)
+
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Synthetic_inlabru\\ETAS_sampling\\spatial_ETAS_utils.R")
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Data_import\\StatSeisFuncs.R")
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Data_import\\inlabru_import_functions.R")
+
+crs_wgs84 <- CRS(SRS_string='EPSG:4326')
+crs_Ita <- CRS(SRS_string='EPSG:7794')
+crs_Ita_km <- fm_crs_set_lengthunit(crs_Ita, "km")
+
+colnames(Hm4_etasdec) <- c("date", "time", "y", "x", "mag", "sigMw", "pb")
+coordinates(Hm4_etasdec) <- c("x", "y")
+proj4string(Hm4_etasdec) <- CRS(SRS_string='EPSG:4326')
+
+
+Hm4_etasdec <- spTransform(Hm4_etasdec, crs_Ita_km)
+#hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+
+hm4etas_bval = bval_distro(Hm4_etasdec$mag, mbin=0.01, uncert="normal", sd=Hm4_etasdec$sigMw, iter=10000)
+
+Hm4_etas <- spTransform(Hm4_etasdec, crs_Ita_km)
+#hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+
+ItalyCollectionPolygon <- read.delim("H://Users/Kirsty/anaconda3/envs/csep-dev/Lib/site-packages/csep/artifacts/Regions/Polygons/Italy/ItalyCollectionPolygon.txt", header=FALSE)
+It_coll_poly <- spatial_poly_from_df(ItalyCollectionPolygon, crs_wgs84)
+
+It_coll_poly_km <- spTransform(It_coll_poly, crs_Ita_km)
+sf_poly_km <- st_as_sf(It_coll_poly_km)
+mesh_poly <- as(st_buffer(sf_poly_km, 50), "Spatial")
+
+hm4e <- crop(Hm4_etas, It_coll_poly_km)
+
+mesh3 <- inla.mesh.2d(boundary=mesh_poly, max.edge = 30, crs=crs_Ita_km)
+ggplot() + gg(mesh3) + gg(It_coll_poly_km) + gg(hm4e)
+```
+```{r}
+hist(hm4etas_bval$b_vals)
+```
+```{r}
+par(mfrow=c(1, 2))
+hist(hm4etas_bval$b_vals, main="ETAS declustered", xlab="b-values")
+hist(m4dec_bval$b_vals, main="GK declustered", xlab="b-values")
+```
+
+Compare spatial distros of these two - points only!
+```{r, warning=FALSE}
+spde.model= inla.spde2.pcmatern(mesh3, prior.sigma=c(5, 0.01), prior.range = c(50, 0.01))
+
+#bru(..., options=list(strategy = "simplified.laplace"))
+
+etas_dec.mdl= coordinates~ Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+etas_dec.fit = lgcp(etas_dec.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50, control.inla(strategy="laplace")))
+
+GK_dec.mdl= coordinates~ Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+GK_dec.fit = lgcp(GK_dec.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50, control.inla(strategy="laplace")))
+
+start_time <- Sys.time()
+Pred_etas_dec <- predict(etas_dec.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_GK_dec <- predict(GK_dec.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+pred_list <- c(Pred_GK_dec, Pred_etas_dec)
+pred_names <- c("Pred_GK_dec", "Pred_etas_dec")
+
+comp_pairplots(pred_list = pred_list, pred_names = pred_names , "YlOrRd", It_coll_poly_km, var_lims=c(-1.5, 1.5))
+
+```
+Compare number of expected events for these
+```{r, warning=FALSE}
+ips <- ipoints(It_coll_poly_km, mesh3)
+Pred_Num_GK <- predict(GK_dec.fit, ips, ~ sum(weight * exp(Smooth + Intercept)))
+Pred_Num_ETAS <- predict(etas_dec.fit, ips, ~ sum(weight * exp(Smooth + Intercept)))
+```
+
+Plot these!
+
+```{r}
+N_etas <- predict(
+  etas_dec.fit, ips,
+  ~ data.frame(
+    N = 10:30,
+    dpois(10:30,
+      lambda = sum(weight * exp(Smooth))
+    )
+  )
+)
+
+N_GK <- predict(
+  GK_dec.fit, ips,
+  ~ data.frame(
+    N = 10:30,
+    dpois(10:30,
+      lambda = sum(weight * exp(Smooth))
+    )
+  )
+)
+
+ggplot(data = N_GK) + geom_line(aes(x = N, y = mean, colour = "ETAS")) + 
+  geom_line(data= N_etas, aes(x = N, y = mean, colour = "GK")) 
+```
+
+
+```{r}
+spde.range <- spde.posterior(etas_dec.fit, "Smooth", what = "range")
+spde.logvar <- spde.posterior(etas_dec.fit, "Smooth", what = "log.variance")
+range.plot <- plot(spde.range)
+var.plot <- plot(spde.logvar)
+
+multiplot(range.plot, var.plot)
+```
+
+```{r, warning=FALSE}
+SRhistMaSlip.mdl= coordinates~ SR(main=StrainRateFn_focal3(x, y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50, control.inla(strategy="laplace")))
+
+start_time <- Sys.time()
+histInv.mdl= coordinates~ IFD(main=FaultDistNormFn(x,y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histInv.fit = lgcp(histInv.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time - start_time
+
+
+SRInv.mdl= coordinates~ IFD(main=FaultDistNormFn(x,y), model="linear") + SR(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50, control.inla(strategy="laplace")))
+
+SRMaIFD.mdl= coordinates~ SR(main=StrainRateFn_focal3(x, y), model="linear") + IFD(main=FaultDistNormFn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaIFD.fit = lgcp(SRMaIFD.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50, control.inla(strategy="laplace")))
+
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SR(main=StrainRateFn_focal3(x, y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+histDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear")  + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histDEM.fit = lgcp(histDEM.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+InvDEMMa.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear")  + IFD(main=FaultDistNormFn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEMMa.fit = lgcp(InvDEMMa.mdl, hm4e,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+
+Pred_Num_SRMaIFD <- predict(SRMaIFD.fit, ips, ~ sum(weight * exp(SR + MaS + IFD + Smooth + Intercept)))
+SRMaIFD.pr <- predict(SRMaIFD.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SR + MaS + IFD + Smooth + Intercept))
+
+```
+
+```{r,warning=FALSE}
+### Run 04/06
+start_time <- Sys.time()
+samp_SRMaIFD <- generate(SRMaIFD.fit, mesh3, coordinates~(SR + MaS + IFD + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+
+```
+
+```{r, warning=FALSE}
+samp_points_SRMAIFD_6010_1yr <- future_apply(samp_SRMaIFD, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRMaIFD$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRMAIFD_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRMAIFD_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRMAIFD_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2010-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRMAIFD_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRMAIFD_6010_1yr, digits = 6), "SRMAIFDe_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+T210_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRMAIFD_6010_1yr$V3))
+stoch_cat_set_SRMAIFD_6010_1yr_Ml <- stoch_cat_set_SRMAIFD_6010_1yr
+stoch_cat_set_SRMAIFD_6010_1yr_Ml$V3 <- T210_Ml
+write.table(format(stoch_cat_set_SRMAIFD_6010_1yr_Ml, digits = 6), "SRMAIFDe_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+```
+```{r}
+## OK this really misbehaves if you try and run the predict without reloading all of the covariate functions!
+Pred_Num_SRhistMaSlip <- predict(SRhistMaSlip.fit, ips, ~ sum(weight * exp(SR + hs + MaS + Smooth + Intercept)))
+
+start_time <- Sys.time()
+samp_SRhistMaSlip <- generate(SRhistMaSlip.fit, mesh3, coordinates~(SR + hs + MaS + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+
+samp_points_SRhistMaSlip_6010_1yr <- future_apply(samp_SRhistMaSlip, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRhistMaSlip$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRhistMaSlip_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRhistMaSlip_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRhistMaSlip_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2010-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRhistMaSlip_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRhistMaSlip_6010_1yr, digits = 6), "SRhistMaSle_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+T210_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRhistMaSlip_6010_1yr$V3))
+stoch_cat_set_SRhistMaSlip_6010_1yr_Ml <- stoch_cat_set_SRhistMaSlip_6010_1yr
+stoch_cat_set_SRhistMaSlip_6010_1yr_Ml$V3 <- T210_Ml
+write.table(format(stoch_cat_set_SRhistMaSlip_6010_1yr_Ml, digits = 6), "SRhistMaSle_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+```
+

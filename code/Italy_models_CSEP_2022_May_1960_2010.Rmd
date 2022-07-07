@@ -1,0 +1,829 @@
+---
+title: "Italy CSEP models 2022"
+output: html_notebook
+---
+
+
+```{r, echo=FALSE}
+library(sp)
+library(sf)
+library(inlabru)
+library(INLA)
+library(future.apply)
+library(ggplot2)
+library(rgeos)
+library(rgdal)
+library(raster)
+library(terra)
+
+plan(multisession)
+
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Synthetic_inlabru\\ETAS_sampling\\spatial_ETAS_utils.R")
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Data_import\\StatSeisFuncs.R")
+source("C:\\Users\\kirst\\Documents\\inlabru_notebooks\\inlabru_earthquake_notebooks\\Data_import\\inlabru_import_functions.R")
+
+crs_wgs84 <- CRS(SRS_string='EPSG:4326')
+crs_Ita <- CRS(SRS_string='EPSG:7794')
+crs_Ita_km <- fm_crs_set_lengthunit(crs_Ita, "km")
+```
+
+```{r, warning=FALSE}
+Horus_m4 <- read.csv("C:/Users/kirst/inlabru-independent/input/Horus_GKDec_1960_2020.csv")
+Horus_m4 <- subset(Horus_m4, Horus_m4$dates < as.POSIXct("2011-01-01"))
+
+colnames(Horus_m4) <- c("n", "dates", "x", "y", "mag", "event_id", "Cluster_Number", "cluster_ref", "ms_ref")
+coordinates(Horus_m4) <- c("x", "y")
+proj4string(Horus_m4) <- CRS(SRS_string='EPSG:4326')
+
+#Horus_m4$sigMw = 0
+## Get mag uncertainties from original horus catalogue
+for (i in 1:length(Horus_m4)){
+  loc <- which(Horus_m4@coords[i,1] == HORUS_Ita_Catalog$Lon & Horus_m4@coords[i,2] == HORUS_Ita_Catalog$Lat & Horus_m4$mag[i] == HORUS_Ita_Catalog$Mw)
+  Horus_m4$sig.mag[i] <- HORUS_Ita_Catalog$sigMw[loc]
+}
+
+m4dec_bval = bval_distro(Horus_m4$mag, mbin=0.01, uncert="normal", sd=Horus_m4$sig.mag, iter=10000)
+
+Horus_m4_dec <- spTransform(Horus_m4, crs_Ita_km)
+#hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+
+It_coll_poly_km <- spTransform(It_coll_poly, crs_Ita_km)
+sf_poly_km <- st_as_sf(It_coll_poly_km)
+mesh_poly <- as(st_buffer(sf_poly_km, 50), "Spatial")
+
+hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+
+mesh3 <- inla.mesh.2d(boundary=mesh_poly, max.edge = 30, crs=crs_Ita_km)
+ggplot() + gg(mesh3) + gg(It_coll_poly_km) + gg(hm4)
+```
+Load covariates and covariate functions
+```{r}
+strainratedata <- read.delim("C:/Users/kirst/Documents/Italy_background/Italy background/strainratedata.txt")
+
+xl <- 2
+xu <- 22
+yl <- 35
+yu <- 52
+SR <- subset(strainratedata, strainratedata$V1 > yl & strainratedata$V1 < yu & strainratedata$V2 > xl & strainratedata$V2 < xu)
+SRGrid <- as.data.frame(cbind(SR$V2, SR$V1, log10(SR$strain_rate)))
+
+## These values are ever so slightly off a regular grid (< .01 lat/lon, usually << 0.001)
+#EPOSGrid[1:2] <- lapply(EPOSGrid[1:2], function(x) as.numeric(round(x, digits=2)))
+
+srrast <- terra::rast(SRGrid, type="xyz")
+
+test3 <- terra::focal(srrast, w=41, fun="mean", na.rm=TRUE, na.policy="only", extend = TRUE)
+crs(test3) <- "epsg:4326"
+
+focal_inf <- terra::as.data.frame(test3, xy=TRUE, na.rm = FALSE)
+focal_inf$focal_mean_norm <- (focal_inf$focal_mean - min(focal_inf$focal_mean))/(max(focal_inf$focal_mean) - min(focal_inf$focal_mean))
+
+test4 <- rast(focal_inf)
+
+StrainRateFn_focal3 <- function(x,y) {
+   # turn coordinates into SpatialPoints object:
+   spp = SpatialPoints(data.frame(x=x,y=y))
+   # attach the appropriate coordinate reference system (CRS)
+   proj4string(spp) = CRS(proj4string(crs_Ita_km))
+   spp = spTransform(spp, CRS(SRS_string = 'EPSG:4326'))
+   ## BUT we want to use terra here so need a spatvector (!)
+   spt <- vect(spp)
+   crs(spt)="epsg:4326"
+   # Extract values at spp coords, from our elev SpatialGridDataFrame
+   v = terra::extract(test4, spt)
+   v[is.na(v)] = -2 # NAs are a problem! Remove them
+   return(v$focal_mean_norm)
+ }
+
+
+StrainRateFn_focal3(7200, 4500)
+```
+```{r}
+DEM_merge <- terra::rast("C:/Users/kirst/Documents/Italy_test/Italy_DEM_merged.TIF")
+
+DEM_min <- -29.16
+DEM_max <- 4790.073
+
+DEM_norm_fn <- function(x,y) {
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  spp = spTransform(spp, crs_wgs84)
+  spp_vect <- vect(spp)
+  crs(spp_vect)="epsg:4326"
+  spp_proj2 <- terra::project(spp_vect, crs(DEM_merge))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = terra::extract(DEM_merge, spp_proj2)
+  v$Band_1[is.na(v$Band_1)] = 0 # NAs are a problem! Remove them
+  val <- (v$Band_1 - DEM_min)/(DEM_max - DEM_min)
+  return(val)
+}
+
+DEM_norm_fn(7200, 4500)
+
+```
+```{r}
+Faults3 <- vect("H:/Users/Kirsty/Documents/italy-forecast/Data/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
+sf_faults <- st_as_sf(Faults3)
+
+FaultDistFn= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_Ita_km
+  sf_spp <- st_transform(sf_spp, crs(Faults3))
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- apply(FD, 2,  min)/1000
+
+  return(min_dist)
+}
+
+## plot this as a sanity test
+hist(FaultDistFn(hm4$x, hm4$y))
+```
+
+```{r}
+
+FaultDistFn_lonlat= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_wgs84
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- apply(FD, 2,  min)/1000
+
+  return(min_dist)
+}
+
+Test_grid <- expand.grid(x=seq(from=xl, to= xu, by=0.1), y=seq(from=yl, to=yu, by=0.1))
+
+FD_test <- Test_grid
+
+#FDFn <- Vectorize(FaultDistFn)
+FD_test$FD <- FaultDistFn_lonlat(FD_test$x, FD_test$y)
+coordinates(FD_test) <- c("x", "y")
+gridded(FD_test) <- TRUE
+
+ggplot() + gg(FD_test) + scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "RdPu")) + gg(It_coll_poly)
+
+FaultDistNormFn= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_Ita_km
+  sf_spp <- st_transform(sf_spp, crs_wgs84)
+  
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
+
+  return(min_dist)
+}
+
+max(FaultDistNormFn(hm4$x, hm4$y))
+```
+```{r}
+Hseism<- readRDS("C:/Users/kirst/Documents/Italy_background/Italy background/CPTI_model_km.RDS")
+#Hseism <- model_hist.pred
+
+
+Hseism$med_norm <- (Hseism$median - min(Hseism$median))/(max(Hseism$median) - min(Hseism$median))
+HS_Norm_Fn <-  function(x, y){
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  #spp = spTransform(spp, proj4string(Faults3))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = over(spp,Hseism)
+  hi <- v$med_norm
+  hi[is.na(hi)]=0
+  return(hi)
+}
+
+HS_Norm_Fn(7200, 4500)
+```
+```{r}
+Faults3$SRMa_norm <- (Faults3$SRmax- min(Faults3$SRmax))/(max(Faults3$SRmax) - min(Faults3$SRmax))
+
+
+MaxSlipFn_sp = function(x,y){
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  proj4string(spp) = crs_Ita_km
+  spp = spTransform(spp, crs_wgs84)
+  vt = over(spp, as(Faults3, 'Spatial'))$SRMa_norm
+  vt[is.na(vt)]=0
+  #vt1 <- factor(vt)
+  return(vt)
+}
+
+MaxSlipFn_sp(7200, 4500)
+```
+
+```{r, warning=FALSE}
+spde.model= inla.spde2.pcmatern(mesh3, prior.sigma=c(5, 0.01), prior.range = c(50, 0.01))
+
+#bru(..., options=list(strategy = "simplified.laplace"))
+
+SRhistMaSlip.mdl= coordinates~ SR(main=StrainRateFn_focal3(x, y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50, control.inla(strategy="laplace")))
+
+start_time <- Sys.time()
+histInv.mdl= coordinates~ IFD(main=FaultDistNormFn(x,y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histInv.fit = lgcp(histInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time - start_time
+
+
+SRInv.mdl= coordinates~ IFD(main=FaultDistNormFn(x,y), model="linear") + SR(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50, control.inla(strategy="laplace")))
+
+SRMaIFD.mdl= coordinates~ SR(main=StrainRateFn_focal3(x, y), model="linear") + IFD(main=FaultDistNormFn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaIFD.fit = lgcp(SRMaIFD.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50, control.inla(strategy="laplace")))
+
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SR(main=StrainRateFn_focal3(x, y), model="linear") + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+histDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear")  + hs(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histDEM.fit = lgcp(histDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+InvDEMMa.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear")  + IFD(main=FaultDistNormFn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEMMa.fit = lgcp(InvDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+```
+```{r, warning=FALSE}
+
+start_time <- Sys.time()
+InvDEMMa.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear")  + IFD(main=FaultDistNormFn(x, y), model="linear")+ MaS(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEMMa.fit = lgcp(InvDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50, control.inla(strategy="laplace")))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRhistMa <- predict(SRhistMaSlip.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SR + hs + MaS + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_histInv <- predict(histInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (hs + IFD + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRInv <- predict(SRInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SR + IFD + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRMaIFD <-  predict(SRMaIFD.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SR + MaS + IFD + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRhistDEM <- predict(SRhistDEM.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SR + hs + DEM + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_histDEM <- predict(histDEM.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (hs + DEM + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+Pred_InvDEMMa <- predict(InvDEMMa.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (IFD + DEM + MaS + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+```
+```{r}
+pred_list <- c(Pred_SRhistMa, Pred_histInv, Pred_SRInv, Pred_SRMaIFD, Pred_SRhistDEM, Pred_histDEM, Pred_InvDEMMa)
+pred_names <- c("Pred_SRhistMa", "Pred_histInv", "Pred_SRInv", "Pred_SRMaIFD", "Pred_SRhistDEM", "Pred_histDEM", "Pred_InvDEMMa")
+
+comp_pairplots(pred_list = pred_list, pred_names = pred_names , "YlOrRd", It_coll_poly_km, var_lims=c(-1.5, 1.5))
+```
+
+```{r, warning=FALSE}
+ips <- ipoints(It_coll_poly_km, mesh3)
+Pred_Num_SRhistMa <- predict(SRhistMaSlip.fit, ips, ~ sum(weight * exp(SR + hs + MaS + Smooth + Intercept)))
+SRhistMa.pr <- predict(SRhistMaSlip.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SR + hs + MaS + Smooth + Intercept))
+
+Pred_Num_histInv <- predict(histInv.fit, ips, ~ sum(weight * exp( hs + IFD + Smooth + Intercept)))
+histInv.pr <- predict(histInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~(hs + IFD + Smooth + Intercept))
+
+Pred_Num_SRMaIFD <- predict(SRMaIFD.fit, ips, ~ sum(weight * exp(SR + MaS + IFD + Smooth + Intercept)))
+SRMaIFD.pr <- predict(SRMaIFD.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SR + MaS + IFD + Smooth + Intercept))
+
+Pred_Num_SRInv <- predict(SRInv.fit, ips, ~ sum(weight * exp(SR + IFD + Smooth + Intercept)))
+SRInv.pr <- predict(SRInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SR + IFD + Smooth + Intercept))
+
+library(RColorBrewer)
+ggplot2::theme_set(ggplot2::theme_bw())
+lprange <- range(SRhistMa.pr$q0.025, SRhistMa.pr$q0.975, SRMaIFD.pr$q0.025, SRMaIFD.pr$q0.975, SRInv.pr$q0.025, SRInv.pr$q0.975, histInv.pr$q0.025, histInv.pr$q0.975)
+csc <- scale_fill_gradientn(colours = brewer.pal(9, "YlOrRd"), limits = lprange)
+
+#europe <- ne_countries(continent = 'Europe', returnclass = "sf", scale = 'medium')
+
+
+SRhistMaplt <- ggplot() + gg(SRhistMa.pr["q0.025"]) + ggtitle("SR + hist + maxslip") + csc + gg(It_coll_poly_km)
+histInvplt <- ggplot() + gg(histInv.pr) + ggtitle("hist + IFD")  + csc + gg(It_coll_poly_km)
+SRMaIFDplt <- ggplot() + gg(SRMaIFD.pr) + ggtitle("SR + maxslip + IFD") + csc + gg(It_coll_poly_km)
+SRInvplt <- ggplot() + gg(SRInv.pr) + ggtitle("SR + IFD") + csc + gg(It_coll_poly_km)
+
+multiplot(SRhistMaplt, histInvplt, SRMaIFDplt, SRInvplt, cols=2)
+```
+
+```{r, warning=FALSE}
+samp_histInv <- generate(histInv.fit, mesh3, coordinates~(hs + IFD + Smooth + Intercept), n.samples = 10000)
+start_time <- Sys.time()
+samp_SRMaIFD <- generate(SRMaIFD.fit, mesh3, coordinates~(SR + MaS + IFD + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+start_time <- Sys.time()
+samp_SRInv <- generate(SRInv.fit, mesh3, coordinates~(SR + IFD + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+## Not run yet...
+start_time <- Sys.time()
+samp_SRhistMA <- generate(SRhistMaSlip.fit, mesh3, coordinates~(SR + hs + MaS + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+
+start_time <- Sys.time()
+Pred_Num_SRhistDEM <- predict(SRhistDEM.fit, ips, ~ sum(weight * exp(SR + hs + DEM + Smooth + Intercept)))
+end_time <- Sys.time()
+end_time - start_time
+
+start_time <- Sys.time()
+Pred_Num_InvDEMMa <- predict(InvDEMMa.fit, ips, ~ sum(weight * exp(IFD + DEM + MaS+ Smooth + Intercept)))
+end_time <- Sys.time()
+end_time - start_time
+
+start_time <- Sys.time()
+samp_SRhistDEM <- generate(SRhistDEM.fit, mesh3, coordinates~(SR + hs + DEM + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+start_time <- Sys.time()
+samp_InvDEMMa <- generate(InvDEMMa.fit, mesh3, coordinates~(IFD + DEM + MaS+ Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+```{r}
+Horus_GKDec_1960_2020 <- read.csv("C:/Users/kirst/inlabru-independent/input/Horus_GKDec_1960_2020.csv")
+Hset <- subset(Horus_GKDec_1960_2020, Horus_GKDec_1960_2020$dates < as.POSIXct("2011-01-01"))
+m4dec_bval = bval_distro(Hset$mag, mbin=0.01, uncert="normal", sd=Hset$sig.mag, iter=10000)
+hist(m4dec_bval$b_vals)
+```
+
+
+```{r, warning=FALSE}
+
+samp_points_SRMAIFD_6010_1yr <- future_apply(samp_SRMaIFD, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRhistMa$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRMAIFD_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRMAIFD_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRMAIFD_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2010-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRMAIFD_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRMAIFD_6010_1yr, digits = 6), "SRMAIFD_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+T210_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRMAIFD_6010_1yr$V3))
+stoch_cat_set_SRMAIFD_6010_1yr_Ml <- stoch_cat_set_SRMAIFD_6010_1yr
+stoch_cat_set_SRMAIFD_6010_1yr_Ml$V3 <- T210_Ml
+write.table(format(stoch_cat_set_SRMAIFD_6010_1yr_Ml, digits = 6), "SRMAIFD_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+```{r, warning=FALSE}
+samp_points_histInv_6010_1yr <- future_apply(samp_histInv, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_histInv$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag =6.9, future.seed = 5)
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_histInv_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_histInv_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_histInv_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2010-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_histInv_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_histInv_6010_1yr, digits = 6), "histInv_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+histInv_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_histInv_6010_1yr$V3))
+stoch_cat_setT_histInv_6010_1yr_Ml <- stoch_cat_set_histInv_6010_1yr
+#stoch_cat_set_histInv_6010_1yr_Ml$V3 <- histInv_Ml
+write.table(format(histInv_Ml, digits = 6), "histInv_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+```{r, warning=FALSE}
+
+samp_SRInv <- generate(SRInv.fit, mesh3, coordinates~(SR + IFD + Smooth + Intercept), n.samples = 10000)
+end_time <- Sys.time()
+end_time - start_time
+
+samp_points_SRInv_6010_1yr <- future_apply(samp_SRInv, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRInv$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag=6.9, future.seed = 5)
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRInv_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRInv_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRInv_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2020-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRInv_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRInv_6010_1yr, digits = 6), "SRInv_6010_1yr_fixed.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+SRInv_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRInv_6010_1yr$V3))
+stoch_cat_set_SRInv_6010_1yr_Ml <- stoch_cat_set_SRInv_6010_1yr
+stoch_cat_set_SRInv_6010_1yr_Ml$V3 <- SRInv_Ml
+write.table(format(stoch_cat_set_SRInv_6010_1yr_Ml, digits = 6), "SRInv_6010_1yr_Ml_fixed.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+```{r, warning=FALSE}
+samp_points_SRhistMA_6010_1yr <- future_apply(samp_SRhistMA, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRhistMa$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+###ru  from here
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRhistMA_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRhistMA_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRhistMA_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2020-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRhistMA_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRhistMA_6010_1yr, digits = 6), "SRhistMA_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+SRhistMA_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRMAIFD_6010_1yr$V3))
+stoch_cat_setT_SRhistMA_6010_1yr_Ml <- stoch_cat_set_SRhistMA_6010_1yr
+stoch_cat_setT_SRhistMA_6010_1yr_Ml$V3 <- SRhistMA_Ml
+write.table(format(stoch_cat_setT_SRhistMA_6010_1yr_Ml, digits = 6), "SRhistMA_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+```{r, warning=FALSE}
+samp_points_SRhistDEM_6010_1yr <- future_apply(samp_SRhistDEM, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_SRhistDEM$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+###ru  from here
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_SRhistDEM_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_SRhistDEM_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_SRhistDEM_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2020-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_SRhistDEM_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_SRhistDEM_6010_1yr, digits = 6), "SRhistDEM_6010_1yr_v2.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+SRhistDEM_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_SRhistDEM_6010_1yr$V3))
+stoch_cat_setT_SRhistDEM_6010_1yr_Ml <- stoch_cat_set_SRhistDEM_6010_1yr
+stoch_cat_setT_SRhistDEM_6010_1yr_Ml$V3 <- SRhistDEM_Ml
+write.table(format(stoch_cat_setT_SRhistDEM_6010_1yr_Ml, digits = 6), "SRhistDEM_6010_1yr_v2_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+
+```{r, warning=FALSE}
+samp_points_InvDEMMa_6010_1yr <- future_apply(samp_InvDEMMa, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_InvDEMMa$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+###ru  from here
+
+Cats <- do.call(rbind, lapply(1:10000, function(x){
+  data = spTransform(samp_points_InvDEMMa_6010_1yr[[x]], crs_wgs84)
+  SpatialPointsDataFrame(coords = data@coords,
+                         data = as.data.frame(data))
+})
+)
+
+cat_lens <- as.numeric(unlist(lapply(samp_points_InvDEMMa_6010_1yr, length)))
+Cats$cat_id <- rep(seq(1, length(samp_points_InvDEMMa_6010_1yr), by = 1), times=cat_lens)
+
+
+times <- rep("2020-02-02T01:01:01.020000", length(Cats$mags))
+depth <- rep(10, length(Cats$mags))
+event_id <- seq(1, length(Cats$mags))
+stoch_cat_set_InvDEMMa_6010_1yr <- as.data.frame(cbind(Cats$x, Cats$y, Cats$mags, times, depth, Cats$cat_id, event_id))
+
+## Catalog readers are a bit fussy currently
+write.table(format(stoch_cat_set_InvDEMMa_6010_1yr, digits = 6), "IvDMMa_6010_1yr.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+
+InvDEMMa_Ml <- Mw_to_ML(as.numeric(stoch_cat_set_InvDEMMa_6010_1yr$V3))
+stoch_cat_setT_InvDEMMa_6010_1yr_Ml <- stoch_cat_set_InvDEMMa_6010_1yr
+stoch_cat_setT_InvDEMMa_6010_1yr_Ml$V3 <- InvDEMMa_Ml
+write.table(format(stoch_cat_setT_InvDEMMa_6010_1yr_Ml, digits = 6), "IvDMMa_6010_1yr_Ml.dat", quote = FALSE, row.names = FALSE, col.names = FALSE, sep=",")
+```
+
+Add depths if we have them...
+```{r}
+coordinates(Cats) <- c("x", "y")
+proj4string(Cats) <- CRS(SRS_string='EPSG:4326')
+
+#Faults_sp <- readOGR("H:/Users/Kirsty/Documents/italy-forecast/Data/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
+#proj4string(Faults_sp) <- CRS(SRS_string='EPSG:4326')
+
+## set to max depth
+max_depth <- over(Cats, Faults_sp)$MaxDepth
+max_depth[is.na(max_depth)] = 10
+
+## set to min depth
+min_depth <- over(Cats, Faults_sp)$MinDepth
+min_depth[is.na(min_depth)] = 10
+
+## Some random depth between the two
+rand_depth <- runif(length(min_depth), min=min_depth, max = max_depth)
+
+```
+
+
+### Now let's think about where to put the largest events.
+Options:
+* Largest events go in highest intensity areas - this is trickier because you need to go back to your spatial intensity map and extract values (but I think this is not impossible...)
+* Largest events are events which are on faults (if at all)
+
+```{r}
+## lets start with just one cat until we get the hang of it. 
+## Does stacking MGR distros give you an MGR distro?
+## Intuition says probably yes, but not necessarily the other way around!
+testCat <- subset(stoch_cat_set_histInv_6010_1yr, stoch_cat_set_histInv_6010_1yr$V6 == 1 )
+hist(as.numeric(testCat$V3))
+
+testCat$V1 <- as.numeric(testCat$V1)
+testCat$V2 <- as.numeric(testCat$V2)
+coordinates(testCat) <- c("V1", "V2")
+proj4string(testCat) <- CRS(SRS_string='EPSG:4326')
+
+## Load fault info as sp
+## To do: figure out a terra alt for this to avoid future disaster!
+Faults_sp <- readOGR("H:/Users/Kirsty/Documents/italy-forecast/Data/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
+proj4string(Faults_sp) <- CRS(SRS_string='EPSG:4326')
+
+## Return fault information for each event location
+fault_inf <- over(testCat, Faults_sp)
+
+## Order of max magnitudes related to specific faults
+new_order <- sort(fault_inf$MaxMag, decreasing = TRUE, index.return=TRUE,na.last = TRUE)
+## Order of magnitudes
+mag_order <- sort(as.numeric(testCat$V3), decreasing = TRUE, index.return=TRUE)
+#vector[order(index)]
+## sort so largest magnitude is now on fault with highest max mag
+new_mag_order <- mag_order$x[order(new_order$ix)]
+```
+
+Apply to whole cat object...
+```{r}
+fault_inf_cats <- over(Cats, Faults_sp)
+new_order <- sort(fault_inf_cats$MaxMag, decreasing = TRUE, index.return=TRUE,na.last = TRUE)
+## Order of magnitudes
+mag_order <- sort(as.numeric(Cats$mags), decreasing = TRUE, index.return=TRUE)
+#vector[order(index)]
+## sort so largest magnitude is now on fault with highest max mag
+new_mag_order <- mag_order$x[order(new_order$ix)]
+
+plot(new_order$x, new_mag_order)
+```
+```{r}
+plot(Cats$mags, new_mag_order)
+```
+```{r}
+hist(Cats$mags - new_mag_order)
+```
+SO now largest events should be on faults with large max magnitude - none of our tests currently check this though...
+
+```{r}
+generate(histInv.fit, mesh3, coordinates~(hs + IFD + Smooth + Intercept), n.samples = 10000)
+
+samp_InvDEMMa <- generate(InvDEMMa.fit, mesh3, coordinates~(IFD + DEM + MaS+ Smooth + Intercept), n.samples = 10000)
+
+
+proj <- INLA::inla.mesh.project(mesh3, Cats)
+lambda_ratio <- exp(as.vector(proj$A %*% loglambda) - loglambda_max)
+```
+```{r}
+point_sampler_best <- function(loglambda, bdy, mesh,  crs, num_events, b_val, m_min, corner_mag){
+  ## Number of events for single catalogue from a poisson distribution with lambda = num_events
+  cat_n <- rpois(1, num_events)
+  if (cat_n < 1){cat_n =1}
+  ll <- as.data.frame(cbind(mesh$loc[,1], mesh$loc[,2], loglambda))
+  colnames(ll) <- c("x", "y", "loglambda")
+  coordinates(ll) <- c("x", "y")
+  proj4string(ll) <- crs
+  ## Mesh often extends outside our area of interest, crop so we are only considering sampling area bdy
+  llcrop <- crop(ll, bdy)
+  loglambda_max <- max(llcrop$loglambda)
+  
+  #print(loglambda_max)
+  ## Set up a spatialpoints dataframe for our results
+  samp.points <- SpatialPoints(data.frame(x = 0, y = 0))
+  samp.points$mags <- 0
+  samp.points <- samp.points[-1,]
+  proj4string(samp.points) <- crs
+  #print(proj4string(samp.points))
+  num <- 0
+  n1 <- 300000
+  n2 <- 5000000
+  ## To sample the correct number of points, keep going until the num >= cat_n
+  while (num < cat_n){
+    pts <- spsample(bdy, n1, "random")
+    #pts <- spTransform(points, crs)
+    proj <- INLA::inla.mesh.project(mesh, pts)
+    lambda_ratio <- exp(as.vector(proj$A %*% loglambda) - loglambda_max)
+    #print(max(lambda_ratio))
+    #print(sum(proj$ok))
+    keep <- proj$ok & (runif(n1) <= lambda_ratio)
+    kept <- pts[keep]
+    
+    ## If we didn't get any events, run again with more sampled points
+    while (length(kept) == 0){
+      #print("No events kept - trying more locations")
+      pts <- spsample(bdy, n2, "random")
+      
+      proj <- INLA::inla.mesh.project(mesh, pts)
+      lambda_ratio <- exp(as.vector(proj$A %*% loglambda) - loglambda_max)
+      #print(max(lambda_ratio))
+      #print(sum(proj$ok))
+      keep <- proj$ok & (runif(n2) <= lambda_ratio)
+      kept <- pts[keep]
+    }
+    kept$mags <- rep(0, length(kept))
+    
+    samp.points <- rbind(samp.points, kept)
+    num <- length(samp.points)
+    
+  }
+  
+  ## Keep exactly cat_n points, choose these randomly from all of the points we've kept so far
+  kp <- sample(seq(1, length(samp.points), by=1), cat_n, replace=FALSE)
+  samp.points <- samp.points[kp,]
+  
+  samp.points.proj <- INLA::inla.mesh.project(mesh, samp.points)
+  ## Get magnitudes for this catalogue
+  ## If b_val is a list of possible b-values, select one at random. If it's just one b-value, use that.
+  b_est <- b_val[runif(1, 1, length(b_val))]
+  
+  mags <- TapGRM(cat_n, b_est, corner_mag, m_min)
+  ## Now allocate magnitudes based on highest intensity, so highest magnitude is in area with highest intensity of kept catalogue
+  
+  return(samp.points)
+}
+
+```
+
+```{r}
+#future_apply(samp_InvDEMMa, 2, point_sampler_best, bdy=It_coll_poly_km, mesh=mesh3, crs=crs_Ita_km, num_event=(Pred_Num_InvDEMMa$mean), b_val=m4dec_bval$b_vals, m_min=4, corner_mag = 6.9, future.seed = 5)
+
+#samp_InvDEMMa <- generate(InvDEMMa.fit, mesh3, coordinates~(IFD + DEM + MaS+ Smooth + Intercept), n.samples = 10000) 
+
+ll <- as.data.frame(cbind(mesh3$loc[,1], mesh3$loc[,2], samp_InvDEMMa[,1]))
+colnames(ll) <- c("x", "y", "loglambda")
+coordinates(ll) <- c("x", "y")
+proj4string(ll) <- crs_Ita_km
+llcrop <- crop(ll, It_coll_poly_km)
+loglambda_max <- max(llcrop$loglambda)
+
+pts <- spsample(It_coll_poly_km, 10000, "random")
+    #pts <- spTransform(points, crs)
+proj <- INLA::inla.mesh.project(mesh3, pts)
+lambda_ratio <- exp(as.vector(proj$A %*% samp_InvDEMMa[,1]) - max(samp_InvDEMMa[,1]))
+    #print(max(lambda_ratio))
+    #print(sum(proj$ok))
+    keep <- proj$ok & (runif(n1) <= lambda_ratio)
+    kept <- pts[keep]
+    
+    ## If we didn't get any events, run again with more sampled points
+    while (length(kept) == 0){
+      #print("No events kept - trying more locations")
+      pts <- spsample(bdy, n2, "random")
+      
+      proj <- INLA::inla.mesh.project(mesh, pts)
+      lambda_ratio <- exp(as.vector(proj$A %*% loglambda) - loglambda_max)
+      #print(max(lambda_ratio))
+      #print(sum(proj$ok))
+      keep <- proj$ok & (runif(n2) <= lambda_ratio)
+      kept <- pts[keep]
+    }
+    kept$mags <- rep(0, length(kept))
+    
+    samp.points <- rbind(samp.points, kept)
+    num <- length(samp.points)
+    
+
+  
+  ## Keep exactly cat_n points, choose these randomly from all of the points we've kept so far
+  kp <- sample(seq(1, length(samp.points), by=1), cat_n, replace=FALSE)
+  samp.points <- samp.points[kp,]
+  
+  samp.points.proj <- INLA::inla.mesh.project(mesh, samp.points)
+  ## Get magnitudes for this catalogue
+  ## If b_val is a list of possible b-values, select one at random. If it's just one b-value, use that.
+  b_est <- b_val[runif(1, 1, length(b_val))]
+  
+  mags <- TapGRM(cat_n, b_est, corner_mag, m_min)
+```
+### Try using M25 seismicity
+```{r}
+Hseism<- readRDS("C:/Users/kirst/Documents/Italy_background/Italy background/CPTI_model_km.RDS")
+#Hseism <- model_hist.pred
+
+
+Hseism$med_norm <- (Hseism$median - min(Hseism$median))/(max(Hseism$median) - min(Hseism$median))
+HS_Norm_Fn <-  function(x, y){
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  #spp = spTransform(spp, proj4string(Faults3))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = over(spp,Hseism)
+  hi <- v$med_norm
+  hi[is.na(hi)]=0
+  return(hi)
+}
+
+HS_Norm_Fn(7200, 4500)
+```
+
+
