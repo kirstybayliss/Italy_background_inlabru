@@ -1,0 +1,1518 @@
+---
+title: "Italy background spatial July 2022"
+output: html_notebook
+---
+
+This notebook implements inlabru models for spatial seismicity in Italy. It includes the use of the `terra` package as an alternative to spatial data handling with `sp`, `rgdal` and `rgeos`, which are due to be retired in 2023. We still load these because inlabru still uses these at time of writing, so our boundary polygon is still a spatialpolygon object and our catalogue is still a  spatialPoints dataframe. See `terra notebook` for more details on some conversions between the libraries.
+
+All covariates are normalised between 0 and 1 so that they can be compared in a straightforward way.
+
+If you are running this notebook from a previous R session in a saved environment, run the chunks loading covariates and establishing covariate functions again whwen you restart the session - it seems to be the case that (especially for fault data) some of the data is stored incorrectly on saving and though no errors are thrown, things like the predicted number of events will be (almost inexplicably) off.
+
+
+```{r, include=FALSE, warning=FALSE}
+library(sp)
+library(sf)
+library(inlabru)
+library(INLA)
+library(future.apply)
+library(rgeos)
+library(ggplot2)
+library(rgdal)
+library(raster)
+library(terra)
+
+plan(multisession)
+
+
+## In RSTUDIO
+#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+setwd("C:\\Users\\kirst\\Documents\\GitHub\\Italy_background_inlabru")
+#source("source/inlabru_forecast_functions.R")
+source("~/inlabru_notebooks/inlabru_earthquake_notebooks/Data_import/inlabru_import_functions.R")
+crs_wgs84 <- CRS(SRS_string='EPSG:4326')
+crs_Ita <- CRS(SRS_string='EPSG:7794')
+crs_Ita_km <- fm_crs_set_lengthunit(crs_Ita, "km")
+
+
+### Read horus dataset (this has had some pre-processing)
+Horus_m4 <- read.csv("input/Horus_GKDec_1960_2020.csv")
+
+#colnames(Horus_m4) <- c("n", "dates", "x", "y", "mag", "event_id", "Cluster_Number", "cluster_ref", "ms_ref", "sig.mag", "optional")
+coordinates(Horus_m4) <- c("x", "y")
+proj4string(Horus_m4) <- crs_wgs84
+
+
+Horus_m4_dec <- spTransform(Horus_m4, crs_Ita_km)
+
+### Load It_coll_poly and create sp spatialpolygon object
+ItalyCollectionPolygon <- read.delim("input/ItalyCollectionPolygon.txt", header=FALSE)
+It_coll_poly <- spatial_poly_from_df(ItalyCollectionPolygon, crs_wgs84)
+It_coll_poly_km <- spTransform(It_coll_poly, crs_Ita_km)
+sf_poly_km <- st_as_sf(It_coll_poly_km)
+mesh_poly <- as(st_buffer(sf_poly_km, 50), "Spatial")
+
+hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+hm4 <- subset(hm4, hm4$dates < as.POSIXct("2010-01-01"))
+
+################## Set up inlabru model 
+mesh3 <- inla.mesh.2d(boundary=mesh_poly, max.edge = 30, crs=crs_Ita_km)
+spde.model= inla.spde2.pcmatern(mesh3, prior.sigma=c(5, 0.01), prior.range = c(50, 0.01))
+
+```
+
+Import some covariates...
+
+Strain rate map (updated)
+```{r}
+strainratedata <- read.delim("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/strainratedata.txt")
+
+xl <- 2
+xu <- 22
+yl <- 35
+yu <- 52
+SR <- subset(strainratedata, strainratedata$V1 > yl & strainratedata$V1 < yu & strainratedata$V2 > xl & strainratedata$V2 < xu)
+SRGrid <- as.data.frame(cbind(SR$V2, SR$V1, log10(SR$strain_rate)))
+
+## If using e.g. EPOS data, where values are ever so slightly off a regular grid (< .01 lat/lon, usually << 0.001)
+## Round as below to proceed smoothly
+## EPOSGrid[1:2] <- lapply(EPOSGrid[1:2], function(x) as.numeric(round(x, digits=2)))
+
+srrast <- terra::rast(SRGrid, type="xyz")
+
+test3 <- terra::focal(srrast, w=41, fun="mean", na.rm=TRUE, na.policy="only", extend = TRUE)
+crs(test3) <- "epsg:4326"
+
+focal_inf <- terra::as.data.frame(test3, xy=TRUE, na.rm = FALSE)
+focal_inf$focal_mean_norm <- (focal_inf$focal_mean - min(focal_inf$focal_mean))/(max(focal_inf$focal_mean) - min(focal_inf$focal_mean))
+
+test4 <- rast(focal_inf)
+
+StrainRateFn_focal3 <- function(x,y) {
+   # turn coordinates into SpatialPoints object:
+   spp = SpatialPoints(data.frame(x=x,y=y))
+   # attach the appropriate coordinate reference system (CRS)
+   proj4string(spp) = CRS(proj4string(crs_Ita_km))
+   spp = spTransform(spp, CRS(SRS_string = 'EPSG:4326'))
+   ## BUT we want to use terra here so need a spatvector (!)
+   spt <- vect(spp)
+   crs(spt)="epsg:4326"
+   # Extract values at spp coords, from our elev SpatialGridDataFrame
+   v = terra::extract(test4, spt)
+   v[is.na(v)] = -2 # NAs are a problem! Remove them
+   return(v$focal_mean_norm)
+ }
+
+
+StrainRateFn_focal3(7200, 4500)
+```
+
+DEM model (NEW!)
+```{r}
+DEM_merge <- terra::rast("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/Italy_DEM_merged.TIF")
+
+DEM_min <- -29.16
+DEM_max <- 4790.073
+
+DEM_norm_fn <- function(x,y) {
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  spp = spTransform(spp, crs_wgs84)
+  spp_vect <- vect(spp)
+  crs(spp_vect)="epsg:4326"
+  spp_proj2 <- terra::project(spp_vect, crs(DEM_merge))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = terra::extract(DEM_merge, spp_proj2)
+  v$Band_1[is.na(v$Band_1)] = 0 # NAs are a problem! Remove them
+  val <- (v$Band_1 - DEM_min)/(DEM_max - DEM_min)
+  return(val)
+}
+
+DEM_norm_fn(7200, 4500)
+
+```
+
+Heat flow model (NEW!)
+```{r}
+## Only need gstat for this cell
+library(gstat)
+
+IHFC_2021_GHFDB <- read.csv("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/IHFC_2021_GHFDB.csv", header=TRUE, sep=";")
+
+IHFC <- cbind.data.frame(as.numeric(IHFC_2021_GHFDB$lng), IHFC_2021_GHFDB$lat, IHFC_2021_GHFDB$q)
+colnames(IHFC) <- c("lon", "lat", "q")
+IHFC <- subset(IHFC, IHFC$lon > xl & IHFC$lon < xu & IHFC$lat > yl & IHFC$lat < yu)
+rm(IHFC_2021_GHFDB)
+gc()
+
+IHFC_vec <- vect(IHFC)
+v <- voronoi(IHFC_vec)
+p <- as(raster::extent(It_coll_poly), 'SpatialPolygons')  
+tp <- terra::vect(p)
+
+crs(tp)="epsg:4326"
+vc <- crop(v, p)
+r <- terra::rast(vc, res=0.005)
+vr <- terra::rasterize(vc, r, "q")
+
+
+IHFC_vec$q_norm <- (IHFC_vec$q - min(IHFC_vec$q))/(max(IHFC_vec$q) - min(IHFC_vec$q))
+
+d <- data.frame(geom(IHFC_vec)[,c("x", "y")], as.data.frame(IHFC_vec))
+
+gs2 <- gstat(formula=q_norm~1, locations=~x+y, data=d, nmax=5, set=list(idp = 0))
+nn_2 <- interpolate(r, gs2, debug.level=0)
+nnmsk2 <- mask(nn_2, vr)
+plot(nnmsk2, 1)
+
+heatflow_fn <- function(x,y) {
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  spp = spTransform(spp, crs_wgs84)
+  spp_vect <- vect(spp)
+  crs(spp_vect)="epsg:4326"
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = terra::extract(nnmsk2, spp_vect)
+  v[is.na(v)] = 0 # NAs are a problem! Remove them
+  return(v$var1.pred)
+}
+
+heatflow_fn(7200, 4500)
+```
+
+
+Fault distance (updated - uses sf)
+```{r}
+Faults3 <- vect("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
+sf_faults <- st_as_sf(Faults3)
+
+FaultDistFn= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_Ita_km
+  sf_spp <- st_transform(sf_spp, crs(Faults3))
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- apply(FD, 2,  min)/1000
+
+  return(min_dist)
+}
+
+## plot this as a sanity test
+hist(FaultDistFn(hm4$x, hm4$y))
+
+```
+```{r}
+
+FaultDistFn_lonlat= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_wgs84
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- apply(FD, 2,  min)/1000
+
+  return(min_dist)
+}
+
+Test_grid <- expand.grid(x=seq(from=xl, to= xu, by=0.1), y=seq(from=yl, to=yu, by=0.1))
+
+FD_test <- Test_grid
+
+#FDFn <- Vectorize(FaultDistFn)
+FD_test$FD <- FaultDistFn_lonlat(FD_test$x, FD_test$y)
+coordinates(FD_test) <- c("x", "y")
+gridded(FD_test) <- TRUE
+
+ggplot() + gg(FD_test) + scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "RdPu")) + gg(It_coll_poly)
+
+FaultDistNormFn= function(x, y) {
+  # turn coordinates into SpatialPoints object
+  ## Really need to figure out how to just make an sf object first!
+  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_Ita_km
+  sf_spp <- st_transform(sf_spp, crs_wgs84)
+  
+  ## new fault distance calculation
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
+
+  return(min_dist)
+}
+
+max(FaultDistNormFn(hm4$x, hm4$y))
+```
+Historic (smoothed) seismicity
+```{r}
+Hseism<- readRDS("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/CPTI_model_km.RDS")
+#Hseism <- model_hist.pred
+
+
+Hseism$med_norm <- (Hseism$median - min(Hseism$median))/(max(Hseism$median) - min(Hseism$median))
+HS_Norm_Fn <-  function(x, y){
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  #spp = spTransform(spp, proj4string(Faults3))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = over(spp,Hseism)
+  hi <- v$med_norm
+  hi[is.na(hi)]=0
+  return(hi)
+}
+
+HS_Norm_Fn(7200, 4500)
+```
+Slip rate function
+```{r}
+Faults3$SRMa_norm <- (Faults3$SRmax- min(Faults3$SRmax))/(max(Faults3$SRmax) - min(Faults3$SRmax))
+
+### This does not return the right number of points? I cannot figure out *why* but it sometimes returns more values than points
+### Slowly losing my mind over this tbh
+MaxSlipFn = function(x,y){
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  spp = spTransform(spp, crs_wgs84)
+  spp_vect <- vect(spp)
+  crs(spp_vect)="epsg:4326"
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  v = terra::extract(Faults3, spp_vect)
+  v$SRMa_norm[is.na(v$SRMa_norm)]=0
+  #vt1 <- factor(vt)
+  return(v$SRMa_norm)
+}
+
+MaxSlipFn(7200, 4500)
+```
+Distrustful of the above, so until I can figure out what I'm doing wrong, here's the old sp version...
+
+```{r}
+MaxSlipFn_sp = function(x,y){
+  spp = SpatialPoints(data.frame(x=x,y=y))
+  proj4string(spp) = crs_Ita_km
+  spp = spTransform(spp, crs_wgs84)
+  vt = over(spp, as(Faults3, 'Spatial'))$SRMa_norm
+  vt[is.na(vt)]=0
+  #vt1 <- factor(vt)
+  return(vt)
+}
+
+MaxSlipFn_sp(7200, 4500)
+```
+Tectonic zones from ESHM20
+```{r}
+TectZones <- readOGR("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+TectZones_km <- spTransform(TectZones, crs_Ita_km)
+
+tect_poly <- as(st_buffer(sf_poly_km, 150), "Spatial")
+TectZones_It <- crop(TectZones_km, tect_poly)
+
+ggplot() + gg(TectZones_It) + gg(mesh3)
+```
+```{r}
+TectZones_It <- spTransform(TectZones_It, crs_Ita_km)
+
+TectZoneFn <- function(x,y) {
+  # turn coordinates into SpatialPoints object
+  spp = SpatialPoints(data.frame(x=x, y=y)) 
+  # set crs 
+  proj4string(spp) = crs_Ita_km
+  # Extract values at spp coords, from our polygons
+  aval = over(spp, TectZones_It)$a_val
+  if (is.na(aval)){
+    aval = mean(TectZones_It$a_val)
+  }
+  aval =  aval/max(TectZones_It$a_val)
+  return(aval)
+}
+
+TectZoneFn(7200, 4500)
+```
+```{r, warning=FALSE}
+start_time <- Sys.time()
+tectMag_aval.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectMag_aval.fit = lgcp(tectMag_aval.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+```
+
+Slip-fault distance
+```{r}
+SlipDistFn = function(x,y) {
+  FDMax=max(FD_test$FD)
+  # turn coordinates into SpatialPoints object
+  spp = SpatialPoints(data.frame(x=x, y=y)) 
+  
+  # set crs 
+  proj4string(spp) = crs_Ita_km
+  
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  st_crs(sf_spp) <- crs_Ita_km
+  sf_spp <- st_transform(sf_spp, crs_wgs84)
+  
+  ## Convert to projected crs
+  #spp <- spTransform(spp, CRS(SRS_string='EPSG:6875'))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
+  
+  SR <- Faults3$SRmax[apply(FD, 2,  which.min)]/max(Faults3$SRmax)
+  if (is.na(SR)){
+    SR = 0
+  }
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  
+  slip_dist <- SR*min_dist
+
+  return(slip_dist)
+}
+
+SlipDistFn(7200, 4500)
+
+
+
+```
+
+```{r}
+SlipDistFn_lonlat = function(x,y) {
+  FDMax=max(FD_test$FD)
+  # turn coordinates into SpatialPoints object
+  spp = SpatialPoints(data.frame(x=x, y=y)) 
+  
+  # set crs 
+  proj4string(spp) = crs_wgs84
+  
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  #st_crs(sf_spp) <- crs_Ita_km
+  #sf_spp <- st_transform(sf_spp, crs_wgs84)
+  
+  ## Convert to projected crs
+  #spp <- spTransform(spp, CRS(SRS_string='EPSG:6875'))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
+  
+  SR <- Faults3$SRmax[apply(FD, 2,  which.min)]/max(Faults3$SRmax)
+  if (is.na(SR)){
+    SR = 0
+  }
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  
+  slip_dist <- SR*min_dist
+
+  return(slip_dist)
+}
+
+Test_grid <- expand.grid(x=seq(from=xl, to= xu, by=0.1), y=seq(from=yl, to=yu, by=0.1))
+
+
+SD_test <- Test_grid
+SD_test$SD <- SlipDistFn_lonlat(SD_test$x,SD_test$y)
+coordinates(SD_test) <- c("x", "y")
+gridded(SD_test) <- TRUE
+SD_test$SD <- SD_test$SD
+
+ggplot() + gg(SD_test) 
+```
+
+```{r}
+## Make a figure of all covariates
+
+library(rnaturalearth)
+
+## Load up Italy coast map, convert to terra vector object
+it.map <- ne_countries(country = 'Italy', returnclass = "sf", scale = 'medium')
+it_vect <- vect(it.map)
+
+new.extent <- extent(c(6, 19, 36, 48))
+par(mfrow=c(3,3))
+
+
+## Plot heatflow
+plot(nnmsk2, 1, axes=FALSE, main="heatflow", col= brewer.pal(9, "YlOrBr"), ext = new.extent)
+lines(it_vect)
+
+## Plot strainrate
+plot(test3, axes=FALSE, main="log strain rate",  col=brewer.pal(9, "GnBu"), ext = new.extent)
+lines(it_vect)
+
+## plot Fault distance
+plot(terra::rast(raster(FD_test)), axes=FALSE, main="Fault distance", col=colorRampPalette(brewer.pal(9, "RdPu"))(diff(range(FD_test$FD))), ext = new.extent)
+lines(it_vect)
+
+## plot slip distance
+plot(terra::rast(raster(SD_test)), axes=FALSE, main="slip distance", col= brewer.pal(9, "BuGn"), ext = new.extent)
+lines(it_vect)
+
+## plot hist seism
+hist_rast <- raster(Hseism)
+hist_rast <- projectRaster(hist_rast, crs = crs_wgs84)
+plot(terra::rast(hist_rast), axes=FALSE, main="historic seismicity", col= brewer.pal(9, "YlOrRd"), ext = new.extent)
+lines(it_vect)
+
+## plot elevation
+## WARNING: This step takes an age! Strongly recommend only running this when neccessary!
+DEM_rast <- project(DEM_merge,  crs_wgs84)
+
+plot(DEM_rast, axes=FALSE, main="Elevation", ext = new.extent)
+lines(it_vect)
+
+## Plot slip rate
+plot(Faults3, "SRmax", axes=FALSE, main="slip rates",  col= brewer.pal(9, "YlGnBu"))
+lines(it_vect)
+
+## plot tect zones
+TZ_vec <- vect("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+TZ_it <- terra::crop(TZ_vec, vect(spTransform(tect_poly, crs_wgs84)))
+plot(TZ_it, "a_val", axes=FALSE, main="zone a-values",  col= colorRampPalette(brewer.pal(9, "YlGn"))(diff(range(TZ_it$a_val))))
+lines(it_vect, lwd=2 )
+
+##
+plot(it_vect, axes=FALSE)
+lines(vect(It_coll_poly), col="red")
+points(vect(spTransform(hm4, crs_wgs84)))
+```
+
+
+```{r, warning=FALSE}
+start_time <- Sys.time()
+slipdist_norm.mdl= coordinates~ slipdist(main=SlipDistFn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+slipdist_norm.fit = lgcp(slipdist_norm.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+slipdist_bmaxmag.mdl= coordinates~ slipdist(main=SlipDistFn(x, y), model="linear") + aval(main=TectZoneFn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+slipdist_bmaxmag.fit = lgcp(slipdist_bmaxmag.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+slipdist_bzone.mdl= coordinates~ slipdist(main=SlipDistFn(x, y), model="linear") + aval(main=TectZoneFn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+slipdist_bzone.fit = lgcp(slipdist_bzone.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+
+deltaIC(TectMag_aval.fit, slipdist_norm.fit, slipdist_bmaxmag.fit, slipdist_bzone.fit)
+```
+
+```{r, warning=FALSE}
+start_time <- Sys.time()
+slipDistDEM.mdl= coordinates~ slipdist(main=SlipDistFn(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+slipDistDEM.fit = lgcp(slipDistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+tectDEM.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectDEM.fit = lgcp(tectDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+tectMaghist.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectMaghist.fit = lgcp(tectMaghist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+tectSR.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectSR.fit = lgcp(tectSR.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+tectSRhist.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectSRhist.fit = lgcp(tectSRhist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+tectSRhistDEM.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectSRhistDEM.fit = lgcp(tectSRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+
+
+deltaIC(TectMag_aval.fit, slipdist_norm.fit, slipdist_bmaxmag.fit, slipdist_bzone.fit, slipDistDEM.fit, TectDEM.fit, TectSR.fit, TectSRhist.fit )
+
+### TectSRhist.fit	-27114.04	0.0000		
+### TectSR.fit	-26818.45	295.5868		
+### slipDistDEM.fit	-26803.58	310.4621		
+### TectDEM.fit	-26800.38	313.6579		
+### TectMag_aval.fit	-26752.35	361.6892		
+### slipdist_norm.fit	-26752.26	361.7785		
+### slipdist_bzone.fit	-26749.27	364.7680		
+### slipdist_bmaxmag.fit	-26749.20	364.8423	
+```
+```{r, warning=FALSE}
+start_time <- Sys.time()
+tectSRhistDEM.mdl= coordinates~ aval(main=TectZoneFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+TectSRhistDEM.fit = lgcp(tectSRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+
+```
+
+
+
+```{r, warning=FALSE}
+start_time <- Sys.time()
+hist_norm.mdl= coordinates~ hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hist_norm.fit = lgcp(hist_norm.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+MaSlip.mdl= coordinates~ Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+MaSlip.fit = lgcp(MaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+               options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+## fault distance norm
+
+start_time <- Sys.time()
+fault_dist_norm.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+fault_dist_norm.fit = lgcp(fault_dist_norm.mdl, hm4,  domain = list(coordinates = mesh3), 
+                           options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+DEM_norm.mdl= coordinates~ DEM(main=DEM_norm_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+DEM_norm.fit = lgcp(DEM_norm.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+heatflow.mdl= coordinates~ HF1(main=heatflow_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+heatflow.fit = lgcp(heatflow.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SR_focalNorm.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SR_focalNorm.fit = lgcp(SR_focalNorm.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+
+deltaIC(MaSlip.fit, hist_norm.fit, fault_dist_norm.fit, DEM_norm.fit, heatflow.fit, SR_focalNorm.fit, TectMag_aval.fit, slipdist_norm.fit)
+
+# ################
+# Model       DIC Delta.DIC
+# 1       hist_norm.fit -38962.59    0.0000
+# 2        DEM_norm.fit -38746.58  216.0077
+# 3    SR_focalNorm.fit -38734.85  227.7366
+# 4             IFD.fit -38708.72  253.8728
+# 5      fault_dist.fit -38704.83  257.7620
+# 6 fault_dist_norm.fit -38703.31  259.2791
+# 7        heatflow.fit -38677.14  285.4475
+# 8          MaSlip.fit -38280.54  682.0486
+############## Some combos
+
+```
+
+Select some extra models here...
+
+```{r, warning=FALSE}
+
+start_time <- Sys.time()
+InvDEM.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEM.fit = lgcp(InvDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhistMaSlip.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear")+ Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+histInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histInv.fit = lgcp(histInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+SRInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRMaIFD.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + FDN(main=FaultDistNormFn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaIFD.fit = lgcp(SRMaIFD.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+hfMa.mdl = coordinates~  HF1(main=heatflow_fn(x, y), model="linear")  + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hfMa.fit = lgcp(hfMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+hfhist.mdl = coordinates~  HF1(main=heatflow_fn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hfhist.fit = lgcp(hfhist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+InvHF.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + HF1(main=heatflow_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvHF.fit = lgcp(InvHF.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+histDEMhf.mdl= coordinates~ DEM(main=DEM_norm_fn(x, y), model="linear") +  HF1(main=heatflow_fn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histDEMhf.fit = lgcp(histDEMhf.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRDEMInv.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + FDN(main=FaultDistNormFn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRDEMInv.fit = lgcp(SRDEMInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+SRhistDEMMa.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEMMa.fit = lgcp(SRhistDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhistInv.mdl = coordinates ~ FDN(main=FaultDistNormFn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistInv.fit = lgcp(SRhistInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+
+deltaIC(tectSR.fit, tectMaghist.fit, tectDEM.fit, slipdist_bzone.fit, slipDistDEM.fit, TectMagDEM.fit, TectMagSR.fit, TectMagSRhist.fit, SRhistInv.fit, SRhistDEMMa.fit, SRDEMInv.fit, histDEMhf.fit, SRhistDEM.fit, InvHF.fit, hfhist.fit, hfMa.fit, SRMaIFD.fit, SRInv.fit, histInv.fit, SRhistMaSlip.fit, InvDEM.fit, TectSRhistDEM.fit, TectSRhist.fit)
+
+### SRhistDEM.fit	-27143.58	0.00000		
+#SRhistDEMMa.fit	-27133.38	10.20092		
+#histDEMhf.fit	-27126.75	16.83137		
+#TectMagSRhist.fit	-27122.29	21.29293		
+#SRhistInv.fit	-27119.05	24.53447		
+#histInv.fit	-27116.02	27.56048		
+#hfhist.fit	-27112.83	30.74606		
+#SRhistMaSlip.fit	-27111.11	32.46552		
+#SRDEMInv.fit	-26814.24	329.34401		
+#InvDEM.fit	-26809.23	334.34917	
+#slipDistDEM.fit	-26803.87	339.71515		
+#TectMagSR.fit	-26790.76	352.82418		
+#TectMagDEM.fit	-26787.97	355.61078		
+#SRInv.fit	-26776.92	366.65732		
+#InvHF.fit	-26765.73	377.84957		
+#SRMaIFD.fit	-26763.93	379.64767		
+#slipdist_bzone.fit	-26755.20	388.37736		
+#slipdist_bmaxmag.fit	-26755.12	388.46303		
+#hfMa.fit	-26750.48	393.10356	
+```
+```{r, warning=FALSE}
+
+start_time <- Sys.time()
+InvDEMMa.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +  DEM(main=DEM_norm_fn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEMMa.fit = lgcp(InvDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+## Rename for model name consistency
+slipdistTectMag.fit <- slipdist_bzone.fit 
+
+DeltaDic_List <- as.data.frame(deltaIC( slipdistTectMag.fit,  InvDEMMa.fit, TectSR.fit, TectMaghist.fit, TectDEM.fit, slipDistDEM.fit, SRhistInv.fit, SRhistDEMMa.fit, SRDEMInv.fit, histDEMhf.fit, SRhistDEM.fit, InvHF.fit, hfhist.fit, hfMa.fit, SRMaIFD.fit, SRInv.fit, histInv.fit, SRhistMaSlip.fit, InvDEM.fit, TectSRhistDEM.fit, TectSRhist.fit))
+
+mod_list <- list(slipdistTectMag.fit,  InvDEMMa.fit, TectSR.fit, TectMaghist.fit, TectDEM.fit, slipDistDEM.fit, SRhistInv.fit, SRhistDEMMa.fit, SRDEMInv.fit, histDEMhf.fit, SRhistDEM.fit, InvHF.fit, hfhist.fit, hfMa.fit, SRMaIFD.fit, SRInv.fit, histInv.fit, SRhistMaSlip.fit, InvDEM.fit, TectSRhistDEM.fit, TectSRhist.fit)
+
+
+
+extract_model_posteriors <- function(mod){
+  
+  fn <- names(mod$marginals.fixed)
+  print("Names extracted")
+  
+  Range <-spde.posterior(mod, "Smooth", what = "range")
+  Var <- spde.posterior(mod, "Smooth", what = "log.variance")
+  Cor <- spde.posterior(mod,"Smooth", what = "matern.correlation")
+  spde.out <- c(Range, Var, Cor)
+  print("SPDE parameters extracted")
+  RF_Mean <- mean(mod$summary.random$Smooth$mean)
+  RF_sd <- sd(mod$summary.random$Smooth$mean)
+  RF_outs <- c(RF_Mean, RF_sd)
+  V1 <- mod$summary.fixed
+  V1$Names <- fn
+  print("Saving posteriors...")
+  posts <- c(spde.out, V1, mod$waic, mod$summay.linear.predictor, RF_outs)
+  return(posts)
+
+}
+
+Comps <- c("Intercept", "hist", "SRN", "DEM", "FDN", "Ma", "HF1", "aval", "slipdist")
+N <- length(DeltaDic_List$Model)
+m <- matrix(0, ncol = (length(Comps)), nrow = N)
+
+#texst <- lapply()
+
+
+for(i in 1:nrow(DeltaDic_List)){
+  print(i)
+  
+  texst <- extract_model_posteriors(mod_list[[i]])
+  ### Check which components the model has
+  Comp_Check <- Comps %in% texst$Names
+  ### No component, col= 0
+  Comp_Check[which(Comp_Check==FALSE)] = 0
+  Comps_in_mod <- which(Comp_Check != 0)
+  for(j in 1:length(Comps_in_mod)){
+    idx <- Comps_in_mod[j]
+    Comp <- which(texst$Name == Comps[idx])
+    Comp_Check[idx] <- texst$mean[Comp]
+  }
+  m[i,] <- Comp_Check
+}
+
+row.names(m) <-  c( "slipdistTectMag.fit",  "InvDEMMa.fit", "TectSR.fit", "TectMaghist.fit", "TectDEM.fit", "slipDistDEM.fit", "SRhistInv.fit", "SRhistDEMMa.fit", "SRDEMInv.fit", "histDEMhf.fit", "SRhistDEM.fit", "InvHF.fit", "hfhist.fit", "hfMa.fit", "SRMaIFD.fit", "SRInv.fit", "histInv.fit", "SRhistMaSlip.fit", "InvDEM.fit", "TectSRhistDEM.fit", "TectSRhist.fit")
+Model_Data <- as.data.frame(m)
+
+Model_Data$Model_Name <- c( "slipdistTectMag.fit",  "InvDEMMa.fit", "TectSR.fit", "TectMaghist.fit", "TectDEM.fit", "slipDistDEM.fit", "SRhistInv.fit", "SRhistDEMMa.fit", "SRDEMInv.fit", "histDEMhf.fit", "SRhistDEM.fit", "InvHF.fit", "hfhist.fit", "hfMa.fit", "SRMaIFD.fit", "SRInv.fit", "histInv.fit", "SRhistMaSlip.fit", "InvDEM.fit", "TectSRhistDEM.fit", "TectSRhist.fit")
+
+
+for(i in 1:nrow(Model_Data)){
+  print(i)
+   Model_Data$Model_DIC[i] <- DeltaDic_List$DIC[which(DeltaDic_List$Model == Model_Data$Model_Name[i])]
+ }
+
+
+colnames(Model_Data) <- c("Intercept", "HistoricSeismicity", "StrainRate", "Elevation", "FaultDistance",  "MaxSlip", "HeatFlow", "zoneRate", "slipdist", "Model_Name", "DIC")
+
+
+# saveRDS(Model_Data, "ItalyM4_models.rds")
+library(dplyr)
+MD <- tibble::as.tibble(Model_Data)
+
+MD2 <- MD %>%
+  arrange(DIC) %>%
+  select(Intercept, HistoricSeismicity, StrainRate, Elevation, FaultDistance,  MaxSlip, HeatFlow, zoneRate, slipdist)
+
+model_names_ordered <- MD %>% arrange(DIC) %>% select(Model_Name)
+library(heatmaply)
+MD3 <- MD2
+MD3$StrainRate[MD3$StrainRate == 0] <- NA
+MD3$Intercept[MD3$Intercept == 0] <- NA
+MD3$HistoricSeismicity[MD3$HistoricSeismicity == 0] <- NA
+MD3$MaxSlip[MD3$MaxSlip == 0] <- NA
+MD3$Elevation[MD3$Elevation == 0] <- NA
+MD3$FaultDistance[MD3$FaultDistance == 0] <- NA
+MD3$HeatFlow[MD3$HeatFlow == 0] <- NA
+MD3$zoneRate[MD3$zoneRate== 0] <- NA
+MD3$slipdist[MD3$slipdist == 0] <- NA
+
+mat <- MD3
+colnames(mat) <- c("Intercept", "HistoricSeismicity", "StrainRate", "Elevation", "FaultDistance",  "MaxSlip","HeatFlow", "zoneRate", "slipdist")
+rownames(mat) <- model_names_ordered$Model_Name
+mat <-as.matrix(mat)
+
+
+p <- heatmaply(mat, 
+               dendrogram = "none",
+               xlab = "Components", ylab = "Model", 
+               main = "",
+               #scale = "none",
+               grid_color = "white",
+               na.value = "white",
+               grid_width = 0.00001,
+               titleX = FALSE,
+               branches_lwd = 0.1,
+               label_names = c("Model", "Component", "Value"),
+               labCol = colnames(mat),
+               labRow = rownames(mat),
+               heatmap_layers = theme(axis.line=element_blank()
+               )
+)
+
+p
+```
+
+
+```{r}
+start_time <- Sys.time()
+Pred_SR <- predict(SR_focalNorm.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_hist <- predict(hist_norm.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (hist + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_DEM <- predict(DEM_norm.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (DEM + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+Pred_Ma <- predict(MaSlip.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (Ma + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+Pred_hf <- predict(heatflow.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (HF1 + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_IFD <-  predict(fault_dist_norm.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (FDN + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_slipdist <-  predict(slipdist_norm.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (slipdist + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_tect <-  predict(TectMag_aval.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (aval + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+#predlist <- readRDS("C:/Users/kirst/Documents/GitHub/Italy_background_inlabru/pred_list_basemods_aug.rds")
+pred_list <- c(Pred_SR, Pred_hist, Pred_DEM, Pred_IFD, Pred_Ma, Pred_hf, Pred_slipdist, Pred_tect )
+pred_names <- c("Pred_SR", "Pred_hist", "Pred_DEM", "Pred_IFD", "Pred_Ma", "Pred_hf", "Pred_slipdist" ,"Pred_tect")
+
+comp_pairplots(pred_list = pred_list, pred_names = pred_names , "YlOrRd", It_coll_poly_km, var_lims=c(-0.5, 1.5))
+```
+```{r}
+comparison_plots(pred_list, pred_names, "YlOrRd", It_coll_poly_km)
+```
+
+
+Now some model combos
+
+```{r,  warning=FALSE}
+start_time <- Sys.time()
+SRhistMaSlip.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear")+ Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+histInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histInv.fit = lgcp(histInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+SRInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRMaIFD.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + FDN(main=FaultDistNormFn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaIFD.fit = lgcp(SRMaIFD.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+histDEM.mdl= coordinates~ DEM(main=DEM_norm_fn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histDEM.fit = lgcp(histDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+hfDEM.mdl= coordinates~ DEM(main=DEM_norm_fn(x, y), model="linear") + HF1(main=heatflow_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hfDEM.fit = lgcp(hfDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRMaDEM.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaDEM.fit = lgcp(SRMaDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRDEM.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRDEM.fit = lgcp(SRDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+hfMa.mdl = coordinates~  HF1(main=heatflow_fn(x, y), model="linear")  + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hfMa.fit = lgcp(hfMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+hfhist.mdl = coordinates~  HF1(main=heatflow_fn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+hfhist.fit = lgcp(hfhist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+deltaIC(SRhistMaSlip.fit,histInv.fit, SRInv.fit, SRMaIFD.fit, histDEM.fit, hfDEM.fit, SRMaDEM.fit, SRDEM.fit, hfMa.fit, hfhist.fit  )
+
+```
+```{r, warning=FALSE}
+start_time <- Sys.time()
+InvDEM.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEM.fit = lgcp(InvDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhist.mdl = coordinates ~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhist.fit = lgcp(SRhist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+InvHF.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + HF1(main=heatflow_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvHF.fit = lgcp(InvHF.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRHF.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + HF1(main=heatflow_fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRHF.fit = lgcp(SRHF.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+sliphist.mdl = coordinates ~ Ma(main=MaxSlipFn_sp(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+sliphist.fit = lgcp(sliphist.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SlipDEM.mdl = coordinates~ Ma(main=MaxSlipFn_sp(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SlipDEM.fit = lgcp(SlipDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Invslip.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+Invslip.fit = lgcp(Invslip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SlipHF.mdl = coordinates~ Ma(main=MaxSlipFn_sp(x, y), model="linear") + HF1(main=heatflow_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SlipHF.fit = lgcp(SlipHF.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+deltaIC(SRhistMaSlip.fit,histInv.fit, SRInv.fit, SRMaIFD.fit, histDEM.fit, hfDEM.fit, SRMaDEM.fit, SRDEM.fit, hfMa.fit, hfhist.fit, InvDEM.fit, SRhist.fit,  InvHF.fit, SRHF.fit, sliphist.fit, SlipDEM.fit, Invslip.fit, SlipHF.fit)
+
+```
+
+```{r, warning=FALSE}
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+histDEMhf.mdl= coordinates~ DEM(main=DEM_norm_fn(x, y), model="linear") +  HF1(main=heatflow_fn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histDEMhf.fit = lgcp(histDEMhf.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRDEMInv.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + FDN(main=FaultDistNormFn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRDEMInv.fit = lgcp(SRDEMInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+SRhistDEMMa.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEMMa.fit = lgcp(SRhistDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhistInv.mdl = coordinates ~ FDN(main=FaultDistNormFn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistInv.fit = lgcp(SRhistInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRInvMa.mdl = coordinates ~ FDN(main=FaultDistNormFn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInvMa.fit = lgcp(SRInvMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+```
+Now let's look at all these models and their component contributions.
+
+```{r}
+
+
+
+DeltaDic_List <- as.data.frame(deltaIC(SRhistMaSlip.fit,histInv.fit, SRInv.fit, SRMaIFD.fit, histDEM.fit, hfDEM.fit, SRMaDEM.fit, SRDEM.fit, hfMa.fit, hfhist.fit, InvDEM.fit, SRhist.fit,  InvHF.fit, SRHF.fit, sliphist.fit, SlipDEM.fit, Invslip.fit, SlipHF.fit, SRhistDEM.fit, histDEMhf.fit, SRDEMInv.fit, SRhistDEMMa.fit, SRhistInv.fit, Tectb_norm.fit, TectMag_norm.fit, slipdist_norm.fit, InvDEMMa.fit ))
+#SRInvMa.fit
+mod_list <- list(SRhistMaSlip.fit,histInv.fit, SRInv.fit, SRMaIFD.fit, histDEM.fit, hfDEM.fit, SRMaDEM.fit, SRDEM.fit, hfMa.fit, hfhist.fit, InvDEM.fit, SRhist.fit,  InvHF.fit, SRHF.fit, sliphist.fit, SlipDEM.fit, Invslip.fit, SlipHF.fit, SRhistDEM.fit, histDEMhf.fit, SRDEMInv.fit, SRhistDEMMa.fit, SRhistInv.fit,Tectb_norm.fit, TectMag_norm.fit, slipdist_norm.fit, InvDEMMa.fit  )
+#SRInvMa.fit
+#saveRDS(DeltaDIC_List, "Apr22_ItalyHorus_DeltaDICList.rds")
+#saveRDS(mod_list, "Apr22_ItalyHorus_spatModelList_v2.rds")
+
+#T2 <- generate(SRhistMaSlip.fit, mesh2, ~coordinates ~(SR + hs + MaS + Smooth + Intercept), n.samples=10000)
+#saveRDS(T2, "histSRMaSamps_mesh2.rds")
+
+#T3 <- generate(histSR.fit, mesh2, ~coordinates ~(SR + hs + Smooth + Intercept), n.samples=10000)
+#saveRDS(T3, "histSRSamps_mesh2.rds")
+
+#T4 <- generate(SRMa.fit, mesh2, ~coordinates ~(SR + MaS + Smooth + Intercept), n.samples=10000)
+#saveRDS(T4, "SRMaSamps_mesh2.rds")
+#####
+
+extract_model_posteriors <- function(mod){
+  
+  fn <- names(mod$marginals.fixed)
+  print("Names extracted")
+  
+  Range <-spde.posterior(mod, "Smooth", what = "range")
+  Var <- spde.posterior(mod, "Smooth", what = "log.variance")
+  Cor <- spde.posterior(mod,"Smooth", what = "matern.correlation")
+  spde.out <- c(Range, Var, Cor)
+  print("SPDE parameters extracted")
+  RF_Mean <- mean(mod$summary.random$Smooth$mean)
+  RF_sd <- sd(mod$summary.random$Smooth$mean)
+  RF_outs <- c(RF_Mean, RF_sd)
+  V1 <- mod$summary.fixed
+  V1$Names <- fn
+  print("Saving posteriors...")
+  posts <- c(spde.out, V1, mod$waic, mod$summay.linear.predictor, RF_outs)
+  return(posts)
+  #flist <- list()
+  #for(i in 1:length(fn)) flist[[i]] <- plot(MSModel3.fit, fn[i])
+  #multiplot(flist[[1]], flist[[2]], flist[[3]], flist[[4]], flist[[5]], SRFDMSNKRange, SRFDMSNKVar, SRFDMSNKCor,  cols=2)
+  #multiplot(flist[[1]], flist[[2]], Range, Var, Cor,  cols=2)
+}
+
+Comps <- c("Intercept", "hist", "SRN", "DEM", "FDN", "Ma", "HF1", "maxmag", "slipdist")
+N <- length(DeltaDic_List$Model)
+m <- matrix(0, ncol = (length(Comps)), nrow = N)
+
+#texst <- lapply()
+
+
+for(i in 1:nrow(DeltaDic_List)){
+  print(i)
+  #Model_dataframe$ModelName[i] <- DeltaDic_List$Name
+  texst <- extract_model_posteriors(mod_list[[i]])
+  ### Check which components the model has
+  Comp_Check <- Comps %in% texst$Names
+  ### No component, col= 0
+  Comp_Check[which(Comp_Check==FALSE)] = 0
+  Comps_in_mod <- which(Comp_Check != 0)
+  for(j in 1:length(Comps_in_mod)){
+    idx <- Comps_in_mod[j]
+    Comp <- which(texst$Name == Comps[idx])
+    Comp_Check[idx] <- texst$mean[Comp]
+  }
+  m[i,] <- Comp_Check
+}
+
+row.names(m) <-  c("SRhistMaSlip.fit","histInv.fit", "SRInv.fit", "SRMaIFD.fit", "histDEM.fit", "hfDEM.fit", "SRMaDEM.fit", "SRDEM.fit", "hfMa.fit", "hfhist.fit","InvDEM.fit", "SRhist.fit",  "InvHF.fit", "SRHF.fit", "sliphist.fit", "SlipDEM.fit", "Invslip.fit", "SlipHF.fit", "SRhistDEM.fit", "histDEMhf.fit", "SRDEMInv.fit", "SRhistDEMMa.fit", "SRhistInv.fit", "Tectb_norm.fit", "TectMag_norm.fit", "slipdist_norm.fit", "InvDEMMa.fit")
+Model_Data <- as.data.frame(m)
+
+Model_Data$Model_Name <- c("SRhistMaSlip.fit","histInv.fit", "SRInv.fit", "SRMaIFD.fit", "histDEM.fit", "hfDEM.fit", "SRMaDEM.fit", "SRDEM.fit", "hfMa.fit", "hfhist.fit","InvDEM.fit", "SRhist.fit",  "InvHF.fit", "SRHF.fit", "sliphist.fit", "SlipDEM.fit", "Invslip.fit", "SlipHF.fit", "SRhistDEM.fit", "histDEMhf.fit", "SRDEMInv.fit", "SRhistDEMMa.fit", "SRhistInv.fit", "Tectb_norm.fit", "TectMag_norm.fit", "slipdist_norm.fit", "InvDEMMa.fit")
+#"SRInvMa.fit"
+
+for(i in 1:nrow(Model_Data)){
+  print(i)
+   Model_Data$Model_DIC[i] <- DeltaDic_List$DIC[which(DeltaDic_List$Model == Model_Data$Model_Name[i])]
+ }
+#Model_Data$Model_DIC <- DeltaDic_List$DIC[which(DeltaDic_List$Model == Model_Data$Model_Name)]
+colnames(Model_Data) <- c("Intercept", "HistoricSeismicity", "StrainRate", "Elevation", "FaultDistance",  "MaxSlip", "HeatFlow", "zone", "slipdist", "Model_Name", "DIC")
+##"Intercept", "hist", "SRN", "DEM", "FDN", "Ma", "HF1"
+
+# saveRDS(Model_Data, "ItalyM4_models.rds")
+library(dplyr)
+MD <- tibble::as.tibble(Model_Data)
+
+MD2 <- MD %>%
+  arrange(DIC) %>%
+  select(Intercept, HistoricSeismicity, StrainRate, Elevation, FaultDistance,  MaxSlip, HeatFlow, zone, slipdist)
+
+model_names_ordered <- MD %>% arrange(DIC) %>% select(Model_Name)
+library(heatmaply)
+MD3 <- MD2
+MD3$StrainRate[MD3$StrainRate == 0] <- NA
+MD3$Intercept[MD3$Intercept == 0] <- NA
+MD3$HistoricSeismicity[MD3$HistoricSeismicity == 0] <- NA
+MD3$MaxSlip[MD3$MaxSlip == 0] <- NA
+MD3$Elevation[MD3$Elevation == 0] <- NA
+MD3$FaultDistance[MD3$FaultDistance == 0] <- NA
+MD3$HeatFlow[MD3$HeatFlow == 0] <- NA
+MD3$zone[MD3$zone== 0] <- NA
+MD3$slipdist[MD3$slipdist == 0] <- NA
+
+mat <- MD3
+colnames(mat) <- c("Intercept", "HistoricSeismicity", "StrainRate", "Elevation", "FaultDistance",  "MaxSlip","HeatFlow", "zone", "slipdist")
+rownames(mat) <- model_names_ordered$Model_Name
+mat <-as.matrix(mat)
+
+
+p <- heatmaply(mat, 
+               dendrogram = "none",
+               xlab = "Components", ylab = "Model", 
+               main = "",
+               #scale = "none",
+               grid_color = "white",
+               na.value = "white",
+               grid_width = 0.00001,
+               titleX = FALSE,
+               branches_lwd = 0.1,
+               label_names = c("Model", "Component", "Value"),
+               labCol = colnames(mat),
+               labRow = rownames(mat),
+               heatmap_layers = theme(axis.line=element_blank()
+               )
+)
+
+p
+```
+
+Historic seismicity models are best. If we're not including historic seismicity, we want strain rate and elevation. Fault distance contribution is much larger (but negative?) without a historic seismicity component - it has the most dramatic change in contribution of any component. Slip rate contribution also varies, but is weirdly harder to describe - what's going on here?
+```{r}
+## To do in sf:
+#It_poly_sf <- sf::st_as_sf(It_coll_poly_km)
+#Sampled_points <- sf::st_sample(It_poly_sf, 10000)
+## Currently not helpful because our functions all use sp to appease inlabru, but maybe helpful in the future :)
+
+Sampled_points <- sp::spsample(It_coll_poly_km, 100000, type="random")
+
+heatflow = heatflow_fn(Sampled_points$x, Sampled_points$y)
+DEM = DEM_norm_fn(Sampled_points$x, Sampled_points$y)
+hist = HS_Norm_Fn(Sampled_points$x, Sampled_points$y)
+FD = FaultDistNormFn(Sampled_points$x, Sampled_points$y)
+strainrate = StrainRateFn_focal3(Sampled_points$x, Sampled_points$y)
+MaSlip = MaxSlipFn_sp(Sampled_points$x, Sampled_points$y)
+zones = TectZoneFn(Sampled_points$x, Sampled_points$y)
+slipdist = SlipDistFn(Sampled_points$x, Sampled_points$y)
+ 
+covs <- data.frame(hist = hist,  strainrate = strainrate, DEM = DEM,  FD = FD, MaSlip = MaSlip, heatflow = heatflow,  zones = zones, slipdist=slipdist)
+
+library(GGally)
+ggpairs(covs,  upper = list(continuous = wrap("cor", method = "spearman")),  title="covariate correlations") 
+```
+
+Largest correlations between historic seismicity and fault distance - this is not surprising, we'd expect the fault map to be informed by past seismicity (especially large historic earthquakes). Historic seismicity also correlated with strain rates.
+heat flow and elevation don't have large correlations with any of the other inputs. 
+Slip rates have some correlation wuth strain rate, historic seismicity and fault distance, but not massively considering that the same data is used for fault information.
+```{r}
+my_fn <- function(data, mapping, ...){
+      p <- ggplot(data = data, mapping = mapping) + 
+        stat_density2d(aes(fill=..density..), geom="tile", contour = FALSE) +
+        scale_fill_gradientn(colours=rainbow(100))
+      p
+}
+
+cov_sel <- data.frame(hist = hist,  strainrate = strainrate, DEM = DEM,  FD = FD,  heatflow = heatflow,  zones = zones, slipdist=slipdist)
+
+
+ggpairs(cov_sel,  upper = list(continuous = wrap("cor", method = "spearman")),  lower=list(continuous=my_fn), title="covariate correlations")
+```
+
+```{r}
+
+library(rnaturalearth)
+
+it.map <- ne_countries(country = 'Italy', returnclass = "sf", scale = 'medium')
+it_coast <- as(it.map, "Spatial")
+it_coast <- spTransform(it_coast, crs_Ita_km )
+# extract crs
+#italy.crs <- crs(it.map)
+Sampled_points_it <- sp::spsample(It_coll_poly_km, 10000, type="random")
+
+heatflow_it = heatflow_fn(Sampled_points_it$x, Sampled_points_it$y)
+DEM_it = DEM_norm_fn(Sampled_points_it$x, Sampled_points_it$y)
+hist_it = HS_Norm_Fn(Sampled_points_it$x, Sampled_points_it$y)
+FD_it = FaultDistNormFn(Sampled_points_it$x, Sampled_points_it$y)
+strainrate_it = StrainRateFn_focal3(Sampled_points_it$x, Sampled_points_it$y)
+MaSlip_it = MaxSlipFn_sp(Sampled_points_it$x, Sampled_points_it$y)
+zones_it = TectZoneFn(Sampled_points_it$x, Sampled_points_it$y)
+slipdist_it = SlipDistFn(Sampled_points_it$x, Sampled_points_it$y)
+
+covs_it <- data.frame(hist = hist_it,  strainrate = strainrate_it, DEM = DEM_it,  FD = FD_it, MaSlip = MaSlip_it, heatflow = heatflow_it,  zones = zones_it, slipdist=slipdist_it)
+
+my_fn <- function(data, mapping, ...){
+      p <- ggplot(data = data, mapping = mapping) + 
+        stat_density2d(aes(fill=..density..), geom="tile", contour = FALSE) +
+        scale_fill_gradientn(colours=rainbow(100))
+      p
+}
+
+covs_it_sel <- data.frame(hist = hist_it,  strainrate = strainrate_it, DEM = DEM_it,  FD = FD_it, heatflow = heatflow_it,  zones = zones_it, slipdist=slipdist_it)
+
+library(GGally)
+ggpairs(covs_it_sel,  upper = list(continuous = wrap("cor", method = "spearman")),  lower=list(continuous=my_fn), title="covariate correlations")
+
+```
+
+```{r}
+ggcorr(covs, method = c("everything", "pearson")) 
+```
+
+Now let's try some predictions
+
+```{r, warning=FALSE}
+start_time <- Sys.time()
+Pred_SRhistMa <- predict(SRhistMaSlip.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + hist + Ma + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRhistDEM <- predict(SRhistDEM.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + hist + DEM + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRhist <- predict(SRhist.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + hist + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRDEM <-  predict(SRDEM.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + DEM + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+Pred_SRInv <- predict(SRInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~ (SRN + FDN + Smooth + Intercept))
+end_time <- Sys.time()
+end_time- start_time
+```
+```{r}
+source("~/inlabru_notebooks/inlabru_earthquake_notebooks/Data_import/inlabru_import_functions.R")
+library(grid)
+library(gridExtra)
+library(cowplot)
+library(RColorBrewer)
+
+pred_list <- c(Pred_SRhistMa, Pred_SRhistDEM, Pred_SRhist, Pred_SRDEM, Pred_SRInv)
+pred_names <- c("Pred_SRhistMa", "Pred_SRhistDEM", "Pred_SRhist", "Pred_SRDEM", "Pred_SRInv")
+
+comp_pairplots(pred_list = pred_list, pred_names = pred_names , "YlOrRd", It_coll_poly_km, var_lims=c(-0.5, 1.5))
+```
+```{r, warning=FALSE}
+
+start_time <- Sys.time()
+SRInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+### Estimate number of events from observed intensity
+ips <- ipoints(It_coll_poly_km, mesh3)
+start_time <- Sys.time()
+Pred_Num_SRInv <- predict(SRInv.fit, ips, ~ sum(weight * exp(SRN + FDN + Smooth + Intercept)))
+end_time <- Sys.time()
+end_time- start_time
+
+Pred_Num_SRInv
+
+start_time <- Sys.time()
+SlipDEM.mdl = coordinates~ Ma(main=MaxSlipFn_sp(x, y), model="linear") + DEM(main=DEM_norm_fn(x, y), model="linear")  + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SlipDEM.fit = lgcp(SlipDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+ips <- ipoints(It_coll_poly_km, mesh3)
+start_time <- Sys.time()
+Pred_Num_slipDEM <- predict(SlipDEM.fit, ips, ~ sum(weight * exp(Ma + DEM + Smooth + Intercept)))
+end_time <- Sys.time()
+end_time- start_time
+
+Pred_Num_slipDEM
+
+
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+ips <- ipoints(It_coll_poly_km, mesh3)
+start_time <- Sys.time()
+Pred_Num_SRhistDEM <- predict(SRhistDEM.fit, ips, ~ sum(weight * exp(SRN + hist + DEM + Smooth + Intercept)))
+end_time <- Sys.time()
+end_time- start_time
+
+Pred_Num_SRhistDEM
+
+```
+```{r, warning=FALSE}
+#m4dec_bval = bval_distro(Horus_m4$mag, mbin=0.01, uncert="normal", sd=Horus_m4$sig.mag, iter=10000)
+
+#### This step will take the longest...
+# start_time <- Sys.time()
+# full_forecast(SRInv.fit,  ~ (SRN + FDN + Smooth + Intercept), n_samples = 10000, mesh=mesh3, bdy = It_coll_poly_km, crs=crs_Ita_km, num_events=(Pred_Num_SRInv$mean), b_val= m4dec_bval$b_vals, m_min = 4, corner_mag=6.8, mag_type="Mw", "SRInv_Apr22.txt")
+# end_time <- Sys.time()
+# end_time- start_time
+
+## start here
+start_time <- Sys.time()
+full_forecast(SlipDEM.fit,  ~ (Ma + DEM + Smooth + Intercept), n_samples = 100, mesh=mesh3, bdy = It_coll_poly_km, crs=crs_Ita_km, num_events=(Pred_Num_slipDEM$mean), b_val= m4dec_bval$b_vals, m_min = 4, corner_mag=6.8, mag_type="Mw", "SlipDEM_Apr22_test2.txt")
+end_time <- Sys.time()
+end_time- start_time
+
+## RUN ME
+## 100 samples = Time difference of 48.94677 mins
+start_time <- Sys.time()
+full_forecast(SRhistDEM.fit,  ~ (SRN + hist + DEM + Smooth + Intercept), n_samples = 10000, mesh=mesh3, bdy = It_coll_poly_km, crs=crs_Ita_km, num_events=(Pred_Num_SRhistDEM$mean), b_val= m4dec_bval$b_vals, m_min = 4, corner_mag=6.8, mag_type="Mw", "SRhsDEM_test3.txt")
+end_time <- Sys.time()
+end_time- start_time
+```
+
