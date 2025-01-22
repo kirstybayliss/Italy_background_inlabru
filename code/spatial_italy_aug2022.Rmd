@@ -7,7 +7,7 @@ This notebook implements inlabru models for spatial seismicity in Italy. It incl
 
 All covariates are normalised between 0 and 1 so that they can be compared in a straightforward way.
 
-If you are running this notebook from a previous R session in a saved environment, run the chunks loading covariates and establishing covariate functions again whwen you restart the session - it seems to be the case that (especially for fault data) some of the data is stored incorrectly on saving and though no errors are thrown, things like the predicted number of events will be (almost inexplicably) off.
+If you are running this notebook from a previous R session in a saved environment, run the chunks loading covariates and establishing covariate functions again when you restart the session - it seems to be the case that (especially for fault data) some of the data is stored incorrectly on saving and though no errors are thrown, things like the predicted number of events will be (almost inexplicably) off.
 
 
 ```{r, include=FALSE, warning=FALSE}
@@ -21,22 +21,24 @@ library(ggplot2)
 library(rgdal)
 library(raster)
 library(terra)
+library(cowplot)
+library(gstat)
 
 plan(multisession)
 
 
 ## In RSTUDIO
 #setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
-setwd("C:\\Users\\kirst\\Documents\\GitHub\\Italy_background_inlabru")
+setwd("/home/kbayliss/extra_code/Italy_background_inlabru")
 #source("source/inlabru_forecast_functions.R")
-source("~/inlabru_notebooks/inlabru_earthquake_notebooks/Data_import/inlabru_import_functions.R")
+source("/home/kbayliss/extra_code/Italy_background_inlabru/code/inlabru_import_functions.R")
 crs_wgs84 <- CRS(SRS_string='EPSG:4326')
 crs_Ita <- CRS(SRS_string='EPSG:7794')
 crs_Ita_km <- fm_crs_set_lengthunit(crs_Ita, "km")
 
 
 ### Read horus dataset (this has had some pre-processing)
-Horus_m4 <- read.csv("input/Horus_GKDec_1960_2020.csv")
+Horus_m4 <- read.csv("/home/kbayliss/extra_code/Italy_background_inlabru/input/Horus_GKDec_1960_2020.csv")
 
 #colnames(Horus_m4) <- c("n", "dates", "x", "y", "mag", "event_id", "Cluster_Number", "cluster_ref", "ms_ref", "sig.mag", "optional")
 coordinates(Horus_m4) <- c("x", "y")
@@ -46,13 +48,17 @@ proj4string(Horus_m4) <- crs_wgs84
 Horus_m4_dec <- spTransform(Horus_m4, crs_Ita_km)
 
 ### Load It_coll_poly and create sp spatialpolygon object
-ItalyCollectionPolygon <- read.delim("input/ItalyCollectionPolygon.txt", header=FALSE)
+ItalyCollectionPolygon <- read.delim("/home/kbayliss/extra_code/Italy_background_inlabru/input/ItalyCollectionPolygon.txt", header=FALSE)
 It_coll_poly <- spatial_poly_from_df(ItalyCollectionPolygon, crs_wgs84)
 It_coll_poly_km <- spTransform(It_coll_poly, crs_Ita_km)
 sf_poly_km <- st_as_sf(It_coll_poly_km)
 mesh_poly <- as(st_buffer(sf_poly_km, 50), "Spatial")
 
-hm4 <- crop(Horus_m4_dec, It_coll_poly_km)
+hest <- sf::st_intersection(st_as_sf(Horus_m4_dec), st_as_sf(It_coll_poly_km))
+hm4 <- as(hest, "Spatial")
+
+## No idea why this no longer works, but seems to be a CRS issue :/
+#hm4 <- raster::crop(Horus_m4_dec, It_coll_poly_km)
 hm4 <- subset(hm4, hm4$dates < as.POSIXct("2010-01-01"))
 
 ################## Set up inlabru model 
@@ -65,7 +71,7 @@ Import some covariates...
 
 Strain rate map (updated)
 ```{r}
-strainratedata <- read.delim("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/strainratedata.txt")
+strainratedata <- read.delim("/home/kbayliss/extra_code/Italy_background_inlabru/input/strainratedata.txt")
 
 xl <- 2
 xu <- 22
@@ -88,9 +94,11 @@ focal_inf$focal_mean_norm <- (focal_inf$focal_mean - min(focal_inf$focal_mean))/
 
 test4 <- rast(focal_inf)
 
-StrainRateFn_focal3 <- function(x,y) {
+
+
+StrainRateFn_focal3 <- function(xy) {
    # turn coordinates into SpatialPoints object:
-   spp = SpatialPoints(data.frame(x=x,y=y))
+   spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
    # attach the appropriate coordinate reference system (CRS)
    proj4string(spp) = CRS(proj4string(crs_Ita_km))
    spp = spTransform(spp, CRS(SRS_string = 'EPSG:4326'))
@@ -109,14 +117,15 @@ StrainRateFn_focal3(7200, 4500)
 
 DEM model (NEW!)
 ```{r}
-DEM_merge <- terra::rast("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/Italy_DEM_merged.TIF")
+DEM_merge <- terra::rast("/home/kbayliss/extra_code/Italy_background_inlabru/input/Italy_DEM_merged.TIF")
 
 DEM_min <- -29.16
 DEM_max <- 4790.073
 
-DEM_norm_fn <- function(x,y) {
+DEM_norm_fn <- function(xy) {
   # turn coordinates into SpatialPoints object:
-  spp = SpatialPoints(data.frame(x=x,y=y))
+  #spp = SpatialPoints(data.frame(x=x,y=y))
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   # attach the appropriate coordinate reference system (CRS)
   proj4string(spp) = CRS(proj4string(crs_Ita_km))
   spp = spTransform(spp, crs_wgs84)
@@ -130,7 +139,7 @@ DEM_norm_fn <- function(x,y) {
   return(val)
 }
 
-DEM_norm_fn(7200, 4500)
+#DEM_norm_fn(7200, 4500)
 
 ```
 
@@ -139,7 +148,7 @@ Heat flow model (NEW!)
 ## Only need gstat for this cell
 library(gstat)
 
-IHFC_2021_GHFDB <- read.csv("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/IHFC_2021_GHFDB.csv", header=TRUE, sep=";")
+IHFC_2021_GHFDB <- read.csv("/home/kbayliss/extra_code/Italy_background_inlabru/input/IHFC_2021_GHFDB.csv", header=TRUE, sep=";")
 
 IHFC <- cbind.data.frame(as.numeric(IHFC_2021_GHFDB$lng), IHFC_2021_GHFDB$lat, IHFC_2021_GHFDB$q)
 colnames(IHFC) <- c("lon", "lat", "q")
@@ -167,9 +176,10 @@ nn_2 <- interpolate(r, gs2, debug.level=0)
 nnmsk2 <- mask(nn_2, vr)
 plot(nnmsk2, 1)
 
-heatflow_fn <- function(x,y) {
+heatflow_fn <- function(xy) {
   # turn coordinates into SpatialPoints object:
-  spp = SpatialPoints(data.frame(x=x,y=y))
+  #spp = SpatialPoints(data.frame(x=x,y=y))
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   # attach the appropriate coordinate reference system (CRS)
   proj4string(spp) = CRS(proj4string(crs_Ita_km))
   spp = spTransform(spp, crs_wgs84)
@@ -187,13 +197,14 @@ heatflow_fn(7200, 4500)
 
 Fault distance (updated - uses sf)
 ```{r}
-Faults3 <- vect("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
+Faults3 <- vect("/home/kbayliss/extra_code/Italy_background_inlabru/input/DISS_3.2.1_shp/SHP/CSSPLN321.shp")
 sf_faults <- st_as_sf(Faults3)
 
-FaultDistFn= function(x, y) {
+FaultDistFn= function(xy) {
   # turn coordinates into SpatialPoints object
   ## Really need to figure out how to just make an sf object first!
-  spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  #spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   sf_spp <- st_as_sf(spp)
   # set crs 
   st_crs(sf_spp) <- crs_Ita_km
@@ -208,7 +219,9 @@ FaultDistFn= function(x, y) {
 }
 
 ## plot this as a sanity test
-hist(FaultDistFn(hm4$x, hm4$y))
+#hist(FaultDistFn(hm4$x, hm4$y))
+# New hm4 has messed up coord column names :7
+hist(FaultDistFn(hm4$coords.x1, hm4$coords.x2))
 
 ```
 ```{r}
@@ -240,11 +253,11 @@ gridded(FD_test) <- TRUE
 
 ggplot() + gg(FD_test) + scale_fill_gradientn(colours = RColorBrewer::brewer.pal(9, "RdPu")) + gg(It_coll_poly)
 
-FaultDistNormFn= function(x, y) {
+FaultDistNormFn= function(xy) {
   # turn coordinates into SpatialPoints object
   ## Really need to figure out how to just make an sf object first!
-  spp <- SpatialPoints(data.frame(x=x, y=y)) 
-  
+  #spp <- SpatialPoints(data.frame(x=x, y=y)) 
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   sf_spp <- st_as_sf(spp)
   # set crs 
   st_crs(sf_spp) <- crs_Ita_km
@@ -259,20 +272,23 @@ FaultDistNormFn= function(x, y) {
   return(min_dist)
 }
 
-max(FaultDistNormFn(hm4$x, hm4$y))
+hist(FaultDistFn(hm4$coords.x1, hm4$coords.x2))
+
+max(FaultDistNormFn(hm4$coords.x1, hm4$coords.x2))
 ```
 Historic (smoothed) seismicity
 ```{r}
-Hseism<- readRDS("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/CPTI_model_km.RDS")
+Hseism<- readRDS("/home/kbayliss/extra_code/Italy_background_inlabru/input/CPTI_model_km.RDS")
 #Hseism <- model_hist.pred
 
 
 Hseism$med_norm <- (Hseism$median - min(Hseism$median))/(max(Hseism$median) - min(Hseism$median))
-HS_Norm_Fn <-  function(x, y){
+HS_Norm_Fn <-  function(xy){
   # turn coordinates into SpatialPoints object:
-  spp = SpatialPoints(data.frame(x=x,y=y))
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
+  #spp = SpatialPoints(data.frame(x=x,y=y))
   # attach the appropriate coordinate reference system (CRS)
-  proj4string(spp) = CRS(proj4string(crs_Ita_km))
+  proj4string(spp) = CRS(proj4string(Hseism))
   #spp = spTransform(spp, proj4string(Faults3))
   # Extract values at spp coords, from our elev SpatialGridDataFrame
   v = over(spp,Hseism)
@@ -289,8 +305,9 @@ Faults3$SRMa_norm <- (Faults3$SRmax- min(Faults3$SRmax))/(max(Faults3$SRmax) - m
 
 ### This does not return the right number of points? I cannot figure out *why* but it sometimes returns more values than points
 ### Slowly losing my mind over this tbh
-MaxSlipFn = function(x,y){
-  spp = SpatialPoints(data.frame(x=x,y=y))
+MaxSlipFn = function(xy){
+  #spp = SpatialPoints(data.frame(x=x,y=y))
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   proj4string(spp) = CRS(proj4string(crs_Ita_km))
   spp = spTransform(spp, crs_wgs84)
   spp_vect <- vect(spp)
@@ -307,8 +324,9 @@ MaxSlipFn(7200, 4500)
 Distrustful of the above, so until I can figure out what I'm doing wrong, here's the old sp version...
 
 ```{r}
-MaxSlipFn_sp = function(x,y){
-  spp = SpatialPoints(data.frame(x=x,y=y))
+MaxSlipFn_sp = function(xy){
+  #spp = SpatialPoints(data.frame(x=x,y=y))
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   proj4string(spp) = crs_Ita_km
   spp = spTransform(spp, crs_wgs84)
   vt = over(spp, as(Faults3, 'Spatial'))$SRMa_norm
@@ -319,9 +337,11 @@ MaxSlipFn_sp = function(x,y){
 
 MaxSlipFn_sp(7200, 4500)
 ```
+These give the same results now, it's just that at specificallt 7200, 4500 they are both 0
 Tectonic zones from ESHM20
 ```{r}
-TectZones <- readOGR("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+TectZones <- readOGR("~/data/eshm20-master/input_shapefiles/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+  #readOGR("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
 TectZones_km <- spTransform(TectZones, crs_Ita_km)
 
 tect_poly <- as(st_buffer(sf_poly_km, 150), "Spatial")
@@ -332,9 +352,10 @@ ggplot() + gg(TectZones_It) + gg(mesh3)
 ```{r}
 TectZones_It <- spTransform(TectZones_It, crs_Ita_km)
 
-TectZoneFn <- function(x,y) {
+TectZoneFn <- function(xy) {
   # turn coordinates into SpatialPoints object
-  spp = SpatialPoints(data.frame(x=x, y=y)) 
+  #spp = SpatialPoints(data.frame(x=x, y=y)) 
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   # set crs 
   proj4string(spp) = crs_Ita_km
   # Extract values at spp coords, from our polygons
@@ -359,11 +380,11 @@ end_time- start_time
 
 Slip-fault distance
 ```{r}
-SlipDistFn = function(x,y) {
+SlipDistFn = function(xy) {
   FDMax=max(FD_test$FD)
   # turn coordinates into SpatialPoints object
-  spp = SpatialPoints(data.frame(x=x, y=y)) 
-  
+  #spp = SpatialPoints(data.frame(x=x, y=y)) 
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   # set crs 
   proj4string(spp) = crs_Ita_km
   
@@ -382,9 +403,7 @@ SlipDistFn = function(x,y) {
   min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
   
   SR <- Faults3$SRmax[apply(FD, 2,  which.min)]/max(Faults3$SRmax)
-  if (is.na(SR)){
-    SR = 0
-  }
+  SR[is.na(SR)] = 0 
   ## This gives us a distance to all fault polygons - we just want the closest one
   ## Also convert to km
   
@@ -400,11 +419,11 @@ SlipDistFn(7200, 4500)
 ```
 
 ```{r}
-SlipDistFn_lonlat = function(x,y) {
+SlipDistFn_lonlat = function(xy) {
   FDMax=max(FD_test$FD)
   # turn coordinates into SpatialPoints object
-  spp = SpatialPoints(data.frame(x=x, y=y)) 
-  
+ #spp = SpatialPoints(data.frame(x=x, y=y)) 
+  spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
   # set crs 
   proj4string(spp) = crs_wgs84
   
@@ -423,9 +442,7 @@ SlipDistFn_lonlat = function(x,y) {
   min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
   
   SR <- Faults3$SRmax[apply(FD, 2,  which.min)]/max(Faults3$SRmax)
-  if (is.na(SR)){
-    SR = 0
-  }
+  SR[is.na(SR)] = 0 
   ## This gives us a distance to all fault polygons - we just want the closest one
   ## Also convert to km
   
@@ -435,7 +452,51 @@ SlipDistFn_lonlat = function(x,y) {
 }
 
 Test_grid <- expand.grid(x=seq(from=xl, to= xu, by=0.1), y=seq(from=yl, to=yu, by=0.1))
+FD_test$FD <- FaultDistFn_lonlat(FD_test$x, FD_test$y)
 
+SD_test <- Test_grid
+SD_test$SD <- SlipDistFn_lonlat(SD_test$x,SD_test$y)
+coordinates(SD_test) <- c("x", "y")
+gridded(SD_test) <- TRUE
+SD_test$SD <- SD_test$SD
+
+ggplot() + gg(SD_test) 
+```
+```{r}
+SlipDistFn_lonlat = function(x, y) {
+  FDMax=max(FD_test$FD)
+  # turn coordinates into SpatialPoints object
+  spp = SpatialPoints(data.frame(x=x, y=y)) 
+  #spp = SpatialPoints(data.frame(x = xy[, 1], y = xy[, 2]))
+  # set crs 
+  proj4string(spp) = crs_wgs84
+  
+  sf_spp <- st_as_sf(spp)
+  # set crs 
+  #st_crs(sf_spp) <- crs_Ita_km
+  #sf_spp <- st_transform(sf_spp, crs_wgs84)
+  
+  ## Convert to projected crs
+  #spp <- spTransform(spp, CRS(SRS_string='EPSG:6875'))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  
+  FD <- sf::st_distance(sf_faults, sf_spp)
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- (apply(FD, 2,  min)/1000)/max(FD_test$FD)
+  
+  SR <- Faults3$SRmax[apply(FD, 2,  which.min)]/max(Faults3$SRmax)
+  SR[is.na(SR)] = 0 
+  ## This gives us a distance to all fault polygons - we just want the closest one
+  ## Also convert to km
+  
+  slip_dist <- SR*min_dist
+
+  return(slip_dist)
+}
+
+Test_grid <- expand.grid(x=seq(from=xl, to= xu, by=0.1), y=seq(from=yl, to=yu, by=0.1))
+FD_test$FD <- FaultDistFn_lonlat(FD_test$x, FD_test$y)
 
 SD_test <- Test_grid
 SD_test$SD <- SlipDistFn_lonlat(SD_test$x,SD_test$y)
@@ -455,7 +516,7 @@ library(rnaturalearth)
 it.map <- ne_countries(country = 'Italy', returnclass = "sf", scale = 'medium')
 it_vect <- vect(it.map)
 
-new.extent <- extent(c(6, 19, 36, 48))
+new.extent <- extent(c(5, 20, 35, 49))
 par(mfrow=c(3,3))
 
 
@@ -483,27 +544,36 @@ lines(it_vect)
 
 ## plot elevation
 ## WARNING: This step takes an age! Strongly recommend only running this when neccessary!
-DEM_rast <- project(DEM_merge,  crs_wgs84)
+#DEM_rast <- project(DEM_merge,  crs_wgs84)
 
 plot(DEM_rast, axes=FALSE, main="Elevation", ext = new.extent)
 lines(it_vect)
 
 ## Plot slip rate
-plot(Faults3, "SRmax", axes=FALSE, main="slip rates",  col= brewer.pal(9, "YlGnBu"))
+plot(Faults3, "SRmax", axes=FALSE, main="slip rates",  col= brewer.pal(9, "YlGnBu"), ext = new.extent)
 lines(it_vect)
 
 ## plot tect zones
-TZ_vec <- vect("C://Users/kirst/Documents/GitHub/Italy_background_inlabru/input/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+#TZ_vec <- vect("~/data/eshm20-master/input_shapefiles/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
+TZ_vec <- vect("~/data/eshm20-master/input_shapefiles/eshm20_input_c_tecto_zones/eshm20_tecto_winGT_fs017_dm02_results_v12e.shp")
 TZ_it <- terra::crop(TZ_vec, vect(spTransform(tect_poly, crs_wgs84)))
 plot(TZ_it, "a_val", axes=FALSE, main="zone a-values",  col= colorRampPalette(brewer.pal(9, "YlGn"))(diff(range(TZ_it$a_val))))
 lines(it_vect, lwd=2 )
 
 ##
-plot(it_vect, axes=FALSE)
+plot(it_vect, axes=FALSE, ext = new.extent)
 lines(vect(It_coll_poly), col="red")
 points(vect(spTransform(hm4, crs_wgs84)))
 ```
 
+```{r, warning=FALSE}
+start_time <- Sys.time()
+rfo.mdl= coordinates~ Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+rfo.fit = lgcp(rfo.mdl, hm4,  domain = list(coordinates = mesh3), 
+                    options = list(E = 50), samplers = It_coll_poly_km)
+end_time <- Sys.time()
+end_time- start_time
+```
 
 ```{r, warning=FALSE}
 start_time <- Sys.time()
@@ -692,6 +762,7 @@ end_time <- Sys.time()
 end_time- start_time
 
 
+# worked
 start_time <- Sys.time()
 SRInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
 SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
@@ -774,8 +845,8 @@ end_time <- Sys.time()
 end_time- start_time
 
 
-
-deltaIC(tectSR.fit, tectMaghist.fit, tectDEM.fit, slipdist_bzone.fit, slipDistDEM.fit, TectMagDEM.fit, TectMagSR.fit, TectMagSRhist.fit, SRhistInv.fit, SRhistDEMMa.fit, SRDEMInv.fit, histDEMhf.fit, SRhistDEM.fit, InvHF.fit, hfhist.fit, hfMa.fit, SRMaIFD.fit, SRInv.fit, histInv.fit, SRhistMaSlip.fit, InvDEM.fit, TectSRhistDEM.fit, TectSRhist.fit)
+#tectSR.fit, tectMaghist.fit, tectDEM.fit, slipdist_bzone.fit, slipDistDEM.fit, TectMagDEM.fit, TectMagSR.fit, TectMagSRhist.fit,
+deltaIC( SRhistInv.fit, SRhistDEMMa.fit, SRDEMInv.fit, histDEMhf.fit, SRhistDEM.fit, InvHF.fit, hfhist.fit, hfMa.fit, SRMaIFD.fit, SRInv.fit, histInv.fit, SRhistMaSlip.fit, InvDEM.fit, TectSRhistDEM.fit, TectSRhist.fit)
 
 ### SRhistDEM.fit	-27143.58	0.00000		
 #SRhistDEMMa.fit	-27133.38	10.20092		
@@ -797,6 +868,148 @@ deltaIC(tectSR.fit, tectMaghist.fit, tectDEM.fit, slipdist_bzone.fit, slipDistDE
 #slipdist_bmaxmag.fit	-26755.12	388.46303		
 #hfMa.fit	-26750.48	393.10356	
 ```
+```{r}
+## Rerun to update figure
+start_time <- Sys.time()
+SRhistMaSlip.mdl= coordinates~ SRN(main=StrainRateFn_focal3(coordinates(.data.)), model="linear") + med_norm(main=HS_Norm_Fn(coordinates(.data.)), model="linear")+ SRMa_norm(main=MaxSlipFn_sp(coordinates(.data.)), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRhistMaSlip.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear")+ Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistMaSlip.fit = lgcp(SRhistMaSlip.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SR.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SR.fit = lgcp(SR.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        samplers=It_coll_poly_km, 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SR.mdl= coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SR.fit = lgcp(SR.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SR.mdl= coordinates~ SRN(StrainRateFn_focal3(coordinates(.data.)), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SR.fit = lgcp(SR.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+elev(f.elev(coordinates(.data.)), model = "linear")
+
+start_time <- Sys.time()
+SR.mdl= coordinates~ SRN(eval_spatial(test4), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SR.fit = lgcp(SR.mdl, hm4,  domain = list(coordinates = mesh3), 
+                        options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+
+
+start_time <- Sys.time()
+histInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+histInv.fit = lgcp(histInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRMaIFD.mdl = coordinates~ SRN(main=StrainRateFn_focal3(x, y), model="linear") + FDN(main=FaultDistNormFn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRMaIFD.fit = lgcp(SRMaIFD.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+SRInv.mdl= coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +SRN(main=StrainRateFn_focal3(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRInv.fit = lgcp(SRInv.mdl, hm4,  domain = list(coordinates = mesh3), 
+                 samplers=It_coll_poly_km, 
+                 options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+start_time <- Sys.time()
+SRhistDEM.mdl = coordinates ~ DEM(main=DEM_norm_fn(x, y), model="linear") + SRN(main=StrainRateFn_focal3(x, y), model="linear") + hist(main=HS_Norm_Fn(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+SRhistDEM.fit = lgcp(SRhistDEM.mdl, hm4,  domain = list(coordinates = mesh3), 
+                samplers=It_coll_poly_km, 
+                options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+start_time <- Sys.time()
+InvDEMMa.mdl = coordinates~ FDN(main=FaultDistNormFn(x, y), model="linear") +  DEM(main=DEM_norm_fn(x, y), model="linear") + Ma(main=MaxSlipFn_sp(x, y), model="linear") + Smooth(main=coordinates, model=spde.model) +  Intercept(1)
+InvDEMMa.fit = lgcp(InvDEMMa.mdl, hm4,  domain = list(coordinates = mesh3), 
+                   samplers=It_coll_poly_km, 
+                   options = list(E = 50))
+end_time <- Sys.time()
+end_time- start_time
+
+
+SRhistDEM.pr <- predict(SRhistDEM.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SRN + hist + DEM + Smooth + Intercept))
+
+InvDEMMa.pr <- predict(InvDEMMa.fit, pixels(mesh3, mask=It_coll_poly_km), ~(FDN+ DEM + Ma + Smooth + Intercept))
+```
+
+```{r}
+SRhistMa.pr <- predict(SRhistMaSlip.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SRN + hist + Ma + Smooth + Intercept))
+histInv.pr <- predict(histInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~(hist + FDN + Smooth + Intercept))
+SRMaIFD.pr <- predict(SRMaIFD.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SRN + Ma + FDN + Smooth + Intercept))
+SRInv.pr <- predict(SRInv.fit, pixels(mesh3, mask=It_coll_poly_km), ~(SRN + FDN + Smooth + Intercept))
+
+
+```
+```{r}
+library(rnaturalearth)
+
+it.map <- ne_countries(country = 'Italy', returnclass = "sf", scale = 'medium')
+it_coast <- as(it.map, "Spatial")
+it_coast <- spTransform(it_coast, crs_Ita_km )
+
+ggplot2::theme_set(ggplot2::theme_bw())
+lprange <- range(SRhistMa.pr$mean, SRMaIFD.pr$mean, SRInv.pr$mean,  histInv.pr$mean, InvDEMMa.pr$mean, SRhistDEM.pr$mean )
+csc <- scale_fill_gradientn(colours = brewer.pal(9, "YlOrRd"), limits = lprange)
+
+SRhistMaplt <- ggplot() + gg(SRhistMa.pr) + ggtitle("SR + hist + maxslip") + csc  + gg(it_coast, alpha = 0)
+histInvplt <- ggplot() + gg(histInv.pr) + ggtitle("hist + IFD")  + csc  + gg(it_coast, alpha = 0)
+SRMaIFDplt <- ggplot() + gg(SRMaIFD.pr) + ggtitle("SR + maxslip + IFD") + csc + gg(it_coast, alpha = 0)
+SRInvplt <- ggplot() + gg(SRInv.pr) + ggtitle("SR + IFD") + csc  + gg(it_coast, alpha = 0)
+SRhistDEMplt <- ggplot() + gg(SRhistDEM.pr) + ggtitle("SR + hist + DEM") + csc  + gg(it_coast, alpha = 0)
+InvDEMMaplt <- ggplot() + gg(InvDEMMa.pr) + ggtitle("IFD + DEM + maxslip") + csc  + gg(it_coast, alpha = 0)
+
+
+
+multiplot(SRhistMaplt, histInvplt, SRMaIFDplt, SRInvplt, SRhistDEMplt, InvDEMMaplt,  cols=2)
+```
+
+```{r}
+pdf('some_inlabru_outputs_itmap_test2.pdf')
+multiplot(SRhistMaplt, histInvplt, SRMaIFDplt, SRInvplt, SRhistDEMplt, InvDEMMaplt,cols=2)
+dev.off()
+```
+```{r}
+pdf('three_running_inlabru_outputs.pdf')
+multiplot(SRhistMaplt, histInvplt,  SRInvplt, cols=1)
+dev.off()
+```
+
+
 ```{r, warning=FALSE}
 
 start_time <- Sys.time()
@@ -1457,6 +1670,7 @@ Pred_Num_SRInv <- predict(SRInv.fit, ips, ~ sum(weight * exp(SRN + FDN + Smooth 
 end_time <- Sys.time()
 end_time- start_time
 
+# Well this ran with covariate values but it gives me an obscene number of events...
 Pred_Num_SRInv
 
 start_time <- Sys.time()
@@ -1492,6 +1706,14 @@ end_time- start_time
 
 Pred_Num_SRhistDEM
 
+
+ips <- ipoints(It_coll_poly_km, mesh3)
+start_time <- Sys.time()
+Pred_Num_SRhistMA <- predict(SRhistMaSlip.fit, ips, ~ sum(weight * exp(SRN + hist + Ma + Smooth + Intercept)))
+end_time <- Sys.time()
+end_time- start_time
+
+# These are all evaluationg e30 events, which is clearly not right. 
 ```
 ```{r, warning=FALSE}
 #m4dec_bval = bval_distro(Horus_m4$mag, mbin=0.01, uncert="normal", sd=Horus_m4$sig.mag, iter=10000)
