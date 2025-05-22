@@ -1,0 +1,652 @@
+---
+title: "Spatial seismicity modelling with inlabru"
+author: "Kirsty Bayliss"
+date: "06/04/2021"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## Set up working directory here to avoid problems later - do this in the r setup chunk so all of the notebook uses the same working directory 
+setwd("~/inlabru_earthquake_notebooks")
+## I don't know why you would want to run chunks in different directories but someone thought you should be able to do that at some point which makes this step necessary.
+## Set to knit in current working directory
+knitr::opts_knit$set(root.dir = getwd())
+
+# To check if all necessary packages are installed, run the following
+notinstalled <- setdiff(
+  
+  c("sp", "sf", "ggplot2", "rgdal", "rgeos", 
+    
+    "ggmap", "rgl", "sphereplot", "raster", "lwgeom",
+    
+    "maptools", "maps", "shiny", "tmap", "RColorBrewer"),
+  
+  installed.packages()[,1])
+
+if (length(notinstalled) > 0) install.packages(notinstalled)
+```
+
+This tutorial demonstrates the steps of creating a spatial earthquake model with inlabru. For further details on some of the issues with importing data, see the Data_import notebook. Comparing and ranking different models is discussed in the "Comparing inlabru spatial models" notebook. I recommend running these in the same environment or saving the outputs in an .rds file as discussed in the last section. Future notebooks will extend this to time-independent forecasts for CSEP testing and (eventually) spatio-temporal models.  
+I have tried to highlight some things to keep an eye on and (where necessary) some workarounds that might be useful.  
+There are many packages I have loaded here, and I've left these visible so you can see them all. Most of these are for importing and handling different datatypes. Two files I have sourced here include a collection of R functions for exploratory data analysis (StatSeisFuncs.R), based on some of the CORSSA code and useful additions, and functions I have written specifically for inlabru seismicity models (inlabru_import_functions.R).
+
+```{r libraries, warning=FALSE}
+## Libraries you definitely need for inlabru
+library(INLA)
+library(inlabru)
+## Libraries for spatial data handling 
+options("rgdal_show_exportToProj4_warnings"="none")
+library(rgdal)
+library(sp)
+library(sf)
+library(rgeos)
+library(raster)
+library(lwgeom)
+## RColorBrewer for nice colour palettes
+library(RColorBrewer)
+## maps for spatial boundaries
+library(maps)
+library(mapproj)
+## tmap for plotting polygons attributes in a nicer way 
+library(tmap)
+
+## More functions I will use here
+source('~/inlabru_earthquake_notebooks/Data_import/StatSeisFuncs.R')
+source('~/inlabru_earthquake_notebooks/Data_import/inlabru_import_functions.R')
+```
+
+This tutorial covers the main steps of making an inlabru model:
+  1. Importing your data (see Data_import notebook for more details on this)
+  2. Creating a suitable mesh for your data
+  3. Setting up an SPDE model for your random field
+  4. Fitting models with random field only
+  5. Fitting models with covariates and random field
+  6. Saving these models in a useful and accessible way for later use and other (hopefully) useful things
+  
+The follow-up notebook covers comparing your model results, but I've split this into two for ease of use and because this is the theoretically more complicated part and I wanted to elaborate on some things a bit more. 
+
+For the purposes of making a nice multi-purpose example, I am using synthetic data. The notebook inlabruquake_synth describes how this data was generated. This template can then be applied to real world examples.
+
+# 1. Importing your data
+
+I might have cheated here and made this the simplest possible example. See Data_import notebook for more complicated examples.
+
+```{r}
+## Read in data
+EQs <- read.csv('Synthetic_inlabru/Synthetic_California.csv', header=TRUE)
+## Use head() see what's in the file
+head(EQs)
+```
+In this case we just have x and y coordinates, but real earthquake catalogs will hopefully have some more information than this! The good news is that the following steps are the same regardless of how many other columns are present.
+
+```{r}
+## We're going to rename these to something more appropriate. Totally not necessary though.
+colnames(EQs) <- c("Lon", "Lat")
+
+## Set up as SpatialPoints - to do this we specify which columns are the coordinates 
+## (There was a while where these had to be x and y for some internal mesh reasoning, but it looks like this particular issue is resolved in newer inlabru versions, so the names can be anything)
+## coordinates is from sp
+sp::coordinates(EQs) <- c("Lon", "Lat")
+```
+
+Now we're going to use these data points for our models. Any additional information (magnitudes, depths etc) will still be contained in the SpatialPointsDataFrame. We can add and access columns to this in the same way we would add to a standard dataframe.
+We now attach a CRS to our points. See [this helpful post](https://inbo.github.io/tutorials/tutorials/spatial_crs_coding/) for more details on how the crs should be set.
+```{r}
+## Set crs
+## This is just the EPSG equivalent of WGS84
+crs_wgs84 <- CRS(SRS_string='EPSG:4326')
+
+proj4string(EQs) <- crs_wgs84
+## Plot spatial points to get a feel of what's going on
+ggplot() + gg(EQs) + labs(x="Longitude", y="Latitiude") + theme_classic() + coord_map()
+
+```
+
+# 2. Creating a mesh
+There are a few things to consider when making your mesh. We will work through these below in the order in which we might consider them when building the mesh. The main points to bear in mind are the area you wish to cover with your model, the resolution with which you want to model it and how this can be achieved in a computationally manageable way (ie what you can actually run in a reasonable timeframe). The mesh is the basis on which your random field will be constructed and will be used for the numerical approximation of the intensity, so it's worth taking the time to make a good one!
+
+## Mesh boundary
+Let's start with the spatial extent of our mesh. We can either construct a mesh boundary that is based on our observed points or one that is based on some existing spatial polygon - this might be a country boundary or CSEP testing region. 
+
+To make a boundary from our points, use the `inla.nonconvex.hull` function. We pass to this function the point locations as spatial points and a boundary around these that we want the mesh to extend by. Here, we pass two arguments so that we create a mesh around the area our points are from (with a small buffer) and an extra buffer region around this to reduce any edge effects. When we make the mesh itself, we will specify that the inner mesh is higher resolution. 
+
+```{r}
+## Make sure the data is a SpatialPointsDataFrame
+## In this case it already is, but there's no harm in doing this step anyway
+boundary.loc <- as(EQs, "SpatialPoints")
+
+## Set up some buffer on your points. This should be relative to the spatial dimensions of your dataset, so be careful here.
+## We supply an inner and outer boundary component
+boundary <- list(
+  inla.nonconvex.hull(coordinates(boundary.loc), 1.5),
+  inla.nonconvex.hull(coordinates(boundary.loc), 2))
+
+## This line converts our inner inla.nonconvex.hull object to a spatial polygon that we might pass to our samplers argument later. 
+bdy <- SpatialPolygons(list(Polygons(list(Polygon(boundary[[1]]$loc)), ID="P1")))
+## Make sure the CRS is good
+proj4string(bdy) <- crs_wgs84
+
+## Alternatively use the spatial_poly_from_df function to wrap up these two steps
+## bdy <- spatial_poly_from_df(boundary[[1]]$loc, crs_wgs84)
+```
+
+You should check if this makes sense - sparse datasets might lead to pockets in your mesh that you don't want. Do this by plotting your boundary polygon.
+
+```{r}
+ggplot() + gg(bdy) + gg(EQs) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map()
+```
+
+Alternatively, you might already have a polygon for this. Our synthetic example uses the California RELM polygon, so we can load that in here instead. We load this in from a text file and convert to a polygons object.
+
+```{r, warning=FALSE}
+RELM_poly <- read.delim("PyCSEP_forecasts/RELMTestingPolygon.txt", sep="", header = FALSE)
+
+## Faff alert: we have to make a list of Polygons before we can make the SpatialPolygons object we want here
+## And our list of Polygons is a conversion of the RELM_poly dataframe to a Polygon
+## So there is some nested weirdness here. I wrote the `spatial_poly_from_df` function to make this a bit easier!
+RELM <- spatial_poly_from_df(RELM_poly, crs_wgs84)
+ 
+proj4string(RELM) <-  crs_wgs84
+```
+
+## Making a mesh
+Now that we have a boundary, we want to make the mesh itself. This is quite straightforward to do but kind of tricky to do well, in my experience at least. Maybe you are a mesh natural but I was not.
+
+We use the `inla.mesh.2d` function to make our mesh, passing it our boundary from above. We could also pass the points themselves with the `loc.domain` argument, but I prefer setting up the boundaries as above to make sure these are obvious and accessible later. We pass a list of two components to each argument to get an inner and outer mesh. The `max.edge` argument should be relative to your spatial extent and will (mostly) determine the resolution of your mesh. Your inlabru model will be evaluated at the mesh vertices, so high resolution is good, but this will also come at a computational cost that can be challenging to balance. Smaller `max.edge` will lead to more vertices and a higher model resolution. 
+
+The `min.angle` controls the angle of your mesh triangles. These should similarly be tuned depending on your computational budget and model resolution requirements. The `max.n` and `max.n.strict` arguments keep your mesh from getting out of hand. Please remember to set the `crs` here, or you'll be sorry later.
+
+```{r, warning=FALSE}
+mesh <- inla.mesh.2d(boundary=RELM,
+                      max.edge=c(0.5, 1),
+                      min.angle=c(28, 20),
+                      max.n=c(48000, 16000), ## Safeguard against large meshes.
+                      max.n.strict=c(128000, 128000), ## Don't build a huge mesh!
+                      cutoff=0.05, ## Filter away adjacent points.
+                      crs=crs_wgs84) #
+```
+
+## Tuning your mesh
+
+The first step here should be to plot your mesh. With sparse datasets it is possible that you will end up with patches of your inner area that are actually covered by your outer mesh, or you might not be happy with the resolution you get here. Also check where your points are relative to your mesh.
+
+```{r}
+ggplot() + gg(mesh) + gg(EQs) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map()
+```
+
+Check the number of mesh vertices to make sure this is something reasonable (mine are usually a few thousand for laptop runs).
+
+```{r}
+mesh$n
+```
+
+Now we want to see if this makes sense as a mesh for our data. Use the `inla.mesh.assessment` function for this
+
+```{r}
+out <- inla.mesh.assessment(mesh,
+                            spatial.range = 0.5,
+                            alpha = 2,
+                            dims = c(20, 20))
+
+hist(out$sd.dev[is.finite(out$sd.dev)], main = "Mesh standard deviation", xlab="standard deviation of mesh component")
+```
+Ideally, you want the standard deviation of your mesh to be approximately 1. If you're getting something very different to that, consider adjusting your mesh.
+
+```{r}
+gridded(out) <- TRUE
+ggplot() + gg(out, aes(color = sd.dev)) + coord_equal()
+```
+
+Finn has a nice blog post on mesh assessment [here]( https://www.maths.ed.ac.uk/~flindgre/2018/07/22/spatially-varying-mesh-quality/)
+You can also try out the rshiny app `meshbuilder()` which allows you to interactively construct a mesh with a given point set (I've found this is not ideal for fixed boundary models, however).
+
+# 3. Setting up a random field
+
+This step is one line, but again very important to our model construction. We assume that between the observed locations there is some correlation that we can model with a random field with Matern covariance. We are going to set up the model that maps our mesh to our random field via stochastic partial differential equations (or SPDEs). To do this we need only our mesh object and to specify some (penalised complexity, hence the pc) priors for our Matern covariance in our random field. We specify a prior for the range and standard deviation for the random field. The standard deviation is specified by an upper tail (highest possible sd) and probability of the standard deviation being greater than this, while the range is specified by an a lower tail (lowest expected range) and the probability that the range might be less than this. Ideally your range value should be greater than your mesh edges if you want a model that will work well.
+
+```{r}
+spde.model= inla.spde2.pcmatern(mesh, prior.sigma=c(0.1, 0.01), prior.range = c(1, 0.01))
+```
+
+This creates a model for describing our random field.
+
+# 4. Fitting a random field model
+
+Now we are ready to fit a log-Gaussian Cox process to our data. There are two steps to this particular part of the modelling process.
+
+
+The first is to define our model for the (log) intensity of the point process. This is also sometimes called the `linear predictor` because it describes a linear combination of model components which we use to model the random field. To do this we define a function as we might in other R applications: coordinates are described by a random field that varies spatially and an intercept term. If we have a homogeneous Poisson process we could describe our point locations with a single fixed term (the intercept), and the random field component is modelling extra variation not accounted for by this. 
+
+I've called our random field component `Smooth` but you can call it anything you like. The `main` argument tells the function that we're describing the point locations and the `model` specifies that we want to use our `spde.model`.
+```{r}
+log_int_model <- coordinates ~ Smooth(main=coordinates, model=spde.model) + Intercept(1)
+```
+
+Now we want to fit the model with inlabru. The `lgcp` function is the part which actually uses INLA to fit our model. The `lgcp` function takes our model component description we just set up, the point information and domain and samplers arguments. The `domain` argument specifies the mesh we are using for our model and is a necessary component of the model. The `samplers` argument is optional and defines the region over which you want the model to be applied. This might be the area in which you know you have observations or an area chosen to be consistent with your input covariates or expected outputs. If you choose not to specify the samplers argument, you are essentially telling the model that you have sufficient data over the entire mesh area, which is often not the case for me. This is why we set up a boundary earlier. 
+
+```{r}
+RFOnly.fit <-  lgcp(log_int_model, EQs, domain = list(coordinates = mesh), samplers=RELM)
+```
+
+Now we can look at these results with `summary` to get a feel of what's going on.
+
+```{r}
+summary(RFOnly.fit)
+```
+The `summary` function returns a summary of the model. In this case we only have one fixed effect, which is our intercept. This returns the DIC, WAIC and log-likelihood for our model. We can also see the range and standard deviation for our random field.
+
+Though this is useful, it's not always intuitive to interpret. Instead, we can predict the posterior of the model to compare with our points.
+
+The `predict` function takes our fitted model object, the mesh and the formula describing our predictor. Here we have predicted on the predictor or log scale. Use the `pixels` function to return a SpatialPixelsDataFrame which can be directly plotted, rather than a collection of intensities at mesh vertices only. We can also tell the `pixels` function that we only want this prediction within our RELM area with the `mask` argument.
+
+```{r}
+predicted_field <- predict(RFOnly.fit, pixels(mesh, mask=RELM), ~(Smooth + Intercept))
+
+ggplot() + gg(predicted_field) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map() + gg(EQs)
+```
+
+We can also check the number of expected events that our model predicts. To do this, we define the integration points with the `ipoints` function - these will be our mesh vertices within our boundary (RELM). Then we use the `predict` function again, specifying that we want to predict on the integration points and then sum these to get the number of events.
+
+```{r, warning=FALSE}
+ips <- ipoints(RELM, mesh)
+Pred_Num <- predict(RFOnly.fit, ips, ~ sum(weight * exp(Smooth + Intercept)))
+Pred_Num
+```
+This gives us an estimate of the posterior number of events accounting for uncertainty in our intensity function parameters, but doesn't account for the fact that the number of points will vary, given the intensity function. To get a better understanding of the number of events, we should consider the Poisson uncertainty.
+```{r, warning=FALSE}
+Nest <- predict(
+  RFOnly.fit, ips,
+  ~ data.frame(
+    N = 100:300,
+    dpois(100:300,
+      lambda = sum(weight * exp(Smooth + Intercept))
+    )
+  )
+)
+
+NumPost <- ggplot(data = Nest) + geom_line(aes(x = N, y = mean, colour = "Posterior")) 
+## Mark true number of events with dashed line
+NumPost + geom_vline(xintercept = length(EQs), linetype="dashed", color = "blue")
+```
+So we can see that our model does a nice job of approximating a random field that results in a sensible number of events, but could we make a better model if we considered some covariates?
+
+
+# 5. Fitting models with covariates
+
+And now to the fun part! Just kidding, it's all fun! 
+Now we want to build a model that includes something (or things) we think might influence event locations, which we will call covariates. There are two main approaches to this, and which you use depends on the type of data you have. Where we have categorical data (like the area source regions) we might want to use a factor type model that specifies that the input data describe different data levels. Where we have spatially continuous data, we can include this more straightforwardly in our model. 
+
+
+## Factor covariates
+
+Factor covariates are not my favourite thing, but luckily I'm not often dealing with categorical data. In my models so far, I have included fault information as a binary factor covariate which returns either a '1' if a fault is present at a given location and '0' where there are no faults. 
+
+We're going to use the UCERF3 fault geometry with events buffered by their dip. This is a bit of an unusual case because the fault polygons are stored as rows of a .csv file. Let's load the data and take a look.
+
+```{r}
+FG <- read.csv("Data_import/temp_examples/UCERFFaultGeom.csv", stringsAsFactors = FALSE)
+head(FG)
+```
+Each row contains a name, some information on the fault and the locations of an observed fault trace. The columns In.FM3.1 and In.FM3.2 describe two slightly different sets of faults, so we first subset the dataframe to only include geometry 3.2. 
+Then we use the `PolygonMaker` function, where we have used the R `lapply` method to apply the function to each row of the file in which the polygons are stored.
+```{r, warning=FALSE}
+## UCERF3 has two fault geometries - this says just to use the one!
+FG2 <- subset(FG, FG$In.FM3.2 == 1)
+## Count number of expected fault polygons as rows from fault dataframe
+NFaults <- nrow(FG2)
+n <- seq(1, NFaults,1)
+### Apply faultgeometry function to all faults, make list of fault polygons
+### The first 8 columns of this dataset contain other data that we don't need here, so skip it
+FaultPolyList <- lapply(n, LineMaker, Geom=FG2, cols=9:82)
+### Make list into SpatialPolygons (sp faff)
+FaultPolys <- SpatialLines(lapply(FaultPolyList, function(x){x@lines[[1]]}))
+## Set CRS
+proj4string(FaultPolys) <- crs_wgs84
+
+ggplot() + gg(FaultPolys) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map()
+## Some versions of inlabru have a problem with plotting SpatialLines. If the above doesn't work for you, try:
+# tm_shape(FaultPolys) + tm_lines()
+```
+Now we want to apply a buffer to each of these fault line segments so that they are projected depending on the `Ave.Dip` column in the data. To do this we use a different spatial package (sf) which allows us to buffer the faults more easily. The function `DipBufferFunction` explictly uses the same buffering as in UCERF3: the fault buffer scales with fault dip so that there is a 0km buffer at 50 dip and a 12km buffer for faults at at 90 dip. 
+
+```{r}
+## Transform to sf object from existing Spatial (sp) object
+FL2 <- st_as_sf(FaultPolys)
+## Transform to projected EPSG so we have units in metres - check local key! 3310 is good for California 
+FG_T2 <- st_transform(FL2, 3310)
+
+## To buffer by dip, include fault polygons and the dip information (probably as a column of a spatialpolygons dataframe)
+Faults_DipBuffer <- DipBufferFunction(FG_T2, FG2$Ave.Dip)
+
+## Transform back to 4326/WGS84/lat/lon
+Faults_DipBuffer <- st_transform(Faults_DipBuffer, 4326)
+## Transform back to (sp) Spatial object
+FDB <- as(Faults_DipBuffer, "Spatial")
+
+ggplot() + gg(FDB) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map()
+```
+Now we have a SpatialPolygonsDataFrame describing where our faults are. Currently there is no other information associated with a fault, so to make this binary factor approach possible, we will set a data column for our SpatialPolygons.
+
+```{r}
+FDB$true <- 1
+```
+
+We can either project our polygons to a grid and create a spatial pixels object or create a function that maps the covariate value at any location.  Here, I use the first method, since the function approach is taken for continuous covariates in the next subsection. The key thing to remember is that your SpatialPixels object will need to cover the full area of the model, including the mesh.
+
+```{r}
+## Get dimensions of a bounding box
+box <- data.frame(dim=c("x", "y"), bbox(mesh$loc))
+steps <- 0.05
+
+## Set up x, y based on map extent
+interpolated_x_coordinates<-seq(from = box$min[1], to = box$max[1], by = steps)
+interpolated_y_coordinates<-seq(from = box$min[2], to = box$max[2], by = steps)
+
+# This now will have a list of x and y coordinates for the full sampled grid
+sampled_points<-expand.grid(x = interpolated_x_coordinates, 
+                              y = interpolated_y_coordinates)
+  
+#head(sampled_points)
+
+n_points<-nrow(sampled_points)
+
+coordinates(sampled_points) <- ~x + y
+
+sampled_points <- sp::SpatialPointsDataFrame(coords=sampled_points, 
+                                             data=data.frame(point=seq(1,n_points)))
+
+# setting the proj4string (the projection information) of this layer to be the same as source zones
+proj4string(sampled_points)<- crs_wgs84
+
+overlay<-sp::over(sampled_points,FDB) # overlaying the sampled points 
+sampled_points@data<-overlay # making a full-on data.table for the spatial object
+
+gridded(sampled_points) <- TRUE
+
+ggplot() + gg(sampled_points) + labs(x="Longitude", y="Latitiude") + theme_classic() 
+```
+Now we have a model that will return a 1 if a fault is present. We also want it to return a 0 if there is no fault, instead of NA as currently. 
+
+```{r}
+sampled_points$true[is.na(sampled_points$true)] <- 0
+ggplot() + gg(sampled_points) + labs(x="Longitude", y="Latitiude") + theme_classic() 
+```
+Now we can provide the SpatialPixels object as the `main` argument to the fault component of our model. This time our `model` argument is `factor_full` which tells inlabru we are using factor data. We have called our fault model `true` because this is the name of the data in our SpatialPixels object.
+```{r, warning=FALSE}
+fault_model <- coordinates ~ true(main=sampled_points, model = "factor_full") -Intercept(1)
+# Fit the model
+faultOnly.fit <-  lgcp(fault_model, EQs, domain = list(coordinates = mesh), samplers=RELM)
+```
+
+Now let's look at our model summary:
+```{r}
+summary(faultOnly.fit)
+```
+To plot this, we use the same approach as before but with updated model name and components
+```{r}
+predicted_faults <- predict(faultOnly.fit, pixels(mesh, mask=RELM), ~(true))
+
+ggplot() + gg(predicted_faults) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map() + gg(EQs)
+```
+Because we have not included a random field here, our model is simply reflecting the fault geometry. We can see that the intensity has two levels reflecting the different value of `true`. We can look at this more closely by looking at the posterior mean intensity contribution associated with each of the two layers.
+
+```{r}
+faultOnly.fit$summary.random
+```
+We can look at the posterior distributions for each of the different levels
+```{r}
+flist <- vector("list", NROW(faultOnly.fit$summary.random$true))
+for (i in seq_along(flist)) flist[[i]] <- plot(faultOnly.fit, "true", index = i)
+multiplot(plotlist = flist, cols = 2)
+```
+
+
+How many events would this model predict?
+
+```{r}
+Pred_Num_F <- predict(faultOnly.fit, ips, ~ sum(weight * exp(true)))
+Pred_Num_F$mean
+```
+
+
+But we are still missing a random field component, so let's add one now. We do this by simply adding a component to our model description.
+
+```{r, warning=FALSE}
+fault_RF_model <- coordinates ~ true(main=sampled_points, model = "factor_full") + Smooth(main=coordinates, model=spde.model) - Intercept(1)
+# Fit the model
+faultRF.fit <-  lgcp(fault_RF_model, EQs, domain = list(coordinates = mesh), samplers=RELM)
+```
+
+Again, let's plot this.
+
+```{r, warning=FALSE}
+predicted_faultsRF <- predict(faultRF.fit, pixels(mesh, mask=RELM), ~(true + Smooth))
+
+ggplot() + gg(predicted_faultsRF) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map() + gg(EQs)
+```
+So it seems our random field is not doing very much here, as our predicted intensities are very similar to before. Again, look at the summary to see what's going on.
+
+```{r}
+summary(faultRF.fit)
+```
+The random field component mean is very large, presumably because our fault model does a good job of small scale variation. To understand a bit more of what this means for our model, we can look at the random field component posteriors.
+
+```{r}
+spde.range <- spde.posterior(faultRF.fit, "Smooth", what = "range")
+spde.logvar <- spde.posterior(faultRF.fit, "Smooth", what = "log.variance")
+range.plot <- plot(spde.range)
+var.plot <- plot(spde.logvar)
+
+multiplot(range.plot, var.plot)
+
+```
+The range for the random field is currently very large. This seems unlikely and relates to something I am currently calling the 'samplers issue' - the random field is not performing as expected when we have set a samplers argument, even though the points of interest are limited to our sampling area. In this case, because we are using synthetic data, I know this is not the right range or mean for the random field, but if you re-run these cells removing the `samplers` argument in the fitting you will get a result more consistent with our input random field. These needs further testing, but I think there's an issue somewhere in the `lgcp.sample` function when including CRS which makes this difficult to diagnose. 
+Any way, at least this sort of shows you how to identify some random-field weirdness...
+ We can also look specifically at the Matern correlation and covariance that are giving us these random field results.
+
+```{r}
+corplot <- plot(spde.posterior(faultRF.fit, "Smooth", what = "matern.correlation"))
+covplot <- plot(spde.posterior(faultRF.fit, "Smooth", what = "matern.covariance"))
+multiplot(covplot, corplot)
+```
+The Matern correlation is really small, even at the smallest distances - if we want to see exactly what the random field looks like, we can also plot just the random field component by including only the random field in our predict call.
+
+```{r}
+## Change the formula in the prediction to include only the random field component
+predicted_faultsRFO <- predict(faultRF.fit, pixels(mesh, mask=RELM), ~(Smooth))
+
+ggplot() + gg(predicted_faultsRFO) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map() + gg(EQs)
+```
+Essentially the contribution from the random field is so small that it almost does nothing. 
+
+```{r, warning=FALSE}
+Pred_Num_FRF <- predict(faultRF.fit, ips, ~ sum(weight * exp(true + Smooth)))
+Pred_Num_FRF$mean
+```
+So each of our models has predicted a similar number of events, but let's check the full distribution with a plot again.
+
+```{r, warning=FALSE}
+NestF <- predict(
+  faultOnly.fit, ips,
+  ~ data.frame(
+    N = 100:300,
+    dpois(100:300,
+      lambda = sum(weight * exp(true))
+    )
+  )
+)
+
+NestFRF <- predict(
+  faultRF.fit, ips,
+  ~ data.frame(
+    N = 100:300,
+    dpois(100:300,
+      lambda = sum(weight * exp(true + Smooth))
+    )
+  )
+)
+
+ggplot(data = Nest) + geom_line(aes(x = N, y = mean, colour = "random field only")) + 
+  geom_line(data= NestF, aes(x = N, y = mean, colour = "Faults only"))  +  
+  geom_line(data = NestFRF, aes(x = N, y = mean, colour = "Faults + random field")) + 
+  geom_vline(xintercept = length(EQs), linetype="dashed", color = "blue") 
+```
+So we can see that each of these models results in a very similar posterior mean number of events, which all align closesly with our observations. 
+We can also now compare our three models by DIC using the `deltaIC` function. The DIC is a likelihood-based criterion that penalises by the effective number of model parameters. We use it here to evaluate how well the competing models describe our observed data. We simply pass the function the fitted model objects.
+
+```{r}
+deltaIC(RFOnly.fit, faultOnly.fit, faultRF.fit)
+```
+In this case our fault model with and without random field have very similar DIC, likely because the random field component is comparatively so small. 
+
+
+
+## Continuous covariates
+
+Since we have loaded the fault data, we will construct a distance from fault model as our continuous example, but the process is similar for any continuous covariate. For fault-distance, we can include this either by using a pre-constructed fault distance map or by calculating the fault distance at each point within our linear function. Having previously used the map approach, I can advise that it is not ideal as it suffers from issues you might encounter with any raster data in terms of losing resolution. Though this will be unavoidable with some data sets (strain rate data is especially bad for this given model construction), we can avoid it here by making a mapping function that should make things easier.
+
+```{r}
+## Transform to projected EPSG, suitable for region (in this case 3310) because we want a distance in metres
+FLDF <- spTransform(FDB, CRS(SRS_string='EPSG:3310'))
+
+FaultDistFn = function(x,y) {
+  # turn coordinates into SpatialPoints object
+  spp = SpatialPoints(data.frame(x=x,y=y)) 
+  # set crs 
+  proj4string(spp) = crs_wgs84
+  ## Convert to projected crs
+  spp <- spTransform(spp, CRS(SRS_string='EPSG:3310'))
+  # Extract values at spp coords, from our elev SpatialGridDataFrame
+  FD <- gDistance(FLDF, spp, byid = TRUE)
+  ## This gives us a distance to all foult polygons - we just want the closest one
+  ## Also convert to km
+  min_dist <- min(FD)/1000
+
+  return(min_dist)
+}
+```
+
+Now if we supply any point we should get a distance to the nearest fault.
+
+```{r}
+FaultDistFn(-115, 35)
+```
+The approach for continuous data is very similar, except that we specify our model is `linear` rather than `factor` and we explicitly inlcude our `Intercept(1)` term. We specify also that we want to use the `FaultDistFn` to define our covariate.
+```{r, warning=FALSE}
+FD_model <- coordinates ~ Smooth(main=coordinates, model=spde.model) +  FD(main = FaultDistFn(x,y), model = "linear") + Intercept(1)
+
+FD_fit <- lgcp(FD_model, EQs, domain = list(coordinates = mesh), samplers=RELM)
+```
+
+```{r}
+summary(FD_fit)
+```
+Now the range for the random field is looking better, but the posterior means for the Intercept and FD are identical.
+
+```{r}
+deltaIC(RFOnly.fit, faultOnly.fit, faultRF.fit, FD_fit)
+```
+If we compare the DIC values of this model with the earlier models, the FD model is significantly worse.
+
+```{r, warning = FALSE}
+Pred_Num_FD <- predict(FD_fit, ips, ~ sum(weight * exp(FD + Smooth + Intercept)))
+Pred_Num_FD
+```
+I'm not really sure why this is soooo off but it is clearly bad!
+
+```{r}
+predicted_FD <- predict(FD_fit, pixels(mesh, mask=RELM), ~(Smooth))
+
+ggplot() + gg(predicted_FD) + labs(x="Longitude", y="Latitiude") + theme_classic() +  coord_map() + gg(EQs)
+
+```
+Similarly, we can make a model for the GEAR1 strain rate. In this case we load in the GEAR1 global model and crop to an area of interest.
+
+```{r}
+strainratedata <- read.table("Data_import/temp_examples/GSRM_average_strain_v2.1-20150901.txt", sep='', comment='#')
+
+## The GSRM strain rate data sets from GEM give three components of the strain rate tensor
+## We want the 2nd invariant of strain rate which is calculated as  sqrt(e_xx^2 + e_yy^2 + 2*(e_xy^2))
+strainratedata$strain_rate <- sqrt(strainratedata$V3^2 + strainratedata$V4^2 + 2*(strainratedata$V5^2))
+
+## Set up some vague spatial area for this
+xl <- box$min[1]
+xu <- box$max[1]
+yl <- box$min[2]
+yu <- box$max[2]
+
+SCSR <- subset(strainratedata, strainratedata$V1 > yl & strainratedata$V1 < yu & strainratedata$V2 > xl & strainratedata$V2 < xu)
+SRGrid <- as.data.frame(cbind(SCSR$V2, SCSR$V1, log10(SCSR$strain_rate)))
+rm(strainratedata)
+
+colnames(SRGrid) <- c("x", "y", "SR")
+spg <- SRGrid
+coordinates(spg) <- ~ x + y
+proj4string(spg) = crs_wgs84
+# coerce to SpatialPixelsDataFrame
+gridded(spg) <- TRUE
+```
+
+The GEAR1 strain rate model uses a uniform grid of deforming cells in areas with expected deformation. This means the data is already in a grid format (with all the potential issues that includes!). Thus we can easily convert this to a SpatialPixelsDataFrame which gives us something nice an easy to work with. 
+
+We can then write a `StrainRateFn` to return the strain rate values at any point. To make the data more inlabru friendly, we use the log of the strain rate and set any values with zero strain rate (mostly from cells deemed to be non-deforming in the original model) to have a value of -5 (significantly smaller than all of the recorded strain rate values). Then we can fit models as above by changing the model arguments.
+
+```{r}
+StrainRateFn = function(x,y) {
+  # turn coordinates into SpatialPoints object:
+  spp = SpatialPoints(data.frame(x=x,y=y)) 
+  # attach the appropriate coordinate reference system (CRS)
+  proj4string(spp) = fm_sp_get_crs(FDB)
+  # Extract values at spp coords, from our strain rate SpatialGridDataFrame (spg)
+  v = over(spp,spg) 
+  v[is.na(v)] = -5 # NAs are a problem! Remove them
+  return(v$SR)
+} 
+```
+
+
+# 6. Extra tips
+
+* The `lgcp` fit stage is much faster than the `predict` call for most meshes and the resulting `SpatialPixelsDataFrames` will just sit in memory taking up precious RAM. Though plotting the full prediction is helpful and useful for understanding what's going on, if you're running lots of models try checking the `summary` details and comparing the models with `deltaIC` to get a feel for which models you actually need to plot.
+
+* Save your `predict` SpatialPixelsDataFrames (or maps) as RDS objects and you can load them again later. This is particularly useful for historical/past seismicity models where you might want to reuse one map as a covariate in another model. RDS objects are a weird R datatype which you can't open (as far as I know!) from any other program, but in theory these are an efficient way of saving the object (if you save them all though, you may have a bad time!).
+
+```{r}
+## Save an item as RDS
+saveRDS(predicted_field, "A_RF_prediction.rds")
+
+## Read an rds
+mypred <- readRDS("A_RF_prediction.rds")
+```
+
+* Remember to check where any loaded object has the data stored: a function for the above field model would need to select `v$mean` to get the correct values here (but would otherwise be similar to the StrainRateFn but with `mypred` instead of `spg` in the `over` line).
+
+* Similarly, if you've gone to all the effort of running all these models (and you don't want to have to do it again when your rsession inevitably crashes) you can save a list of the `lgcp` fit objects that you can access later (more on this in the second Spatial_models notebook). 
+```{r}
+mod_list <- list(RFOnly.fit, faultOnly.fit, faultRF.fit, FD_fit)
+saveRDS(mod_list, "ModelList.rds")
+```
+
+And you can save a dataframe of `deltaIC` results (super helpful and takes up very little space so almost always worth it, trust me!) like so:
+
+```{r}
+DeltaDic_List <- as.data.frame(deltaIC(RFOnly.fit, faultOnly.fit, faultRF.fit, FD_fit))
+write.table(DeltaDic_List, "Model_DICs.csv", sep=",", row.names = FALSE)
+```
+
+* Keep an eye on your crs - try to keep these consistent and set for each mesh/function/dataset. You can check two objects have the same crs with `identicalCRS(obj1, obj2)`. This has caused me many hours of stress.
+
+* It's quite important to make sure you don't have NAs in your model and that any covariate data extends outside of your mesh area (especially for factor covariates!). 
+You can replace NAs in your function with something like:
+  
+```{r}
+(any(is.na(v$SR))) {
+    v$SR <- inlabru:::bru_fill_missing(spg, spp, v$SR)
+  }
+```
+
+* If your `lgcp` call fails and you don't know why, try adding `options = list(verbose=TRUE)` to the function arguments. This will print out the full details of the model fitting so it should help you figure out how far the model actually runs.
+
+* Please email if you get stuck :) I have spent so many hours trying to get to grips with all of this I have probably made exactly the same mistake or encountered the same error at some point.
+
